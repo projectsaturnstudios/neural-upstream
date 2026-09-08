@@ -3093,10 +3093,19 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
         // encode past 1.0 and drags the anti-clipping guard across the whole frame
         // -- measured as a heavy loss of saturation at night. Let a night scene
         // stay dark: only real highlights define white.
-        // The ceiling used to be 4.0, which Alan Wake 2 pins against every
-        // frame; a clamped measurement is a wrong measurement.
+        // Both ends of this were tuned on one bright open-world game and both
+        // were wrong for others. The ceiling was 4.0, which Alan Wake 2 pinned
+        // against every frame while its true value was 16. The floor was 0.35,
+        // which Silent Hill 2 pinned against every frame from below: a dark
+        // interior measures under it, so the scene was normalised by a white
+        // point brighter than anything in it and the network was shown a
+        // picture darker than the game's own. A clamped measurement is a wrong
+        // measurement in either direction. The floor is now 0.05, matching what
+        // the exposure-texture path next door already used, which is low enough
+        // for a dark room and still guards the degenerate case of a frame with
+        // no lit pixels at all.
         float pw = p90;
-        if (pw < 0.35f) pw = 0.35f;
+        if (pw < 0.05f) pw = 0.05f;
         if (pw > 32.0f) pw = 32.0f;
         // Fallback only: if the game handed us a real exposure recently, its
         // number wins and the histogram just keeps the guides up to date.
