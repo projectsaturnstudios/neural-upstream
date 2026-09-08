@@ -149,6 +149,9 @@ static void on_present(reshade::api::command_queue *, reshade::api::swapchain *,
 // El fps total no dice donde se va el tiempo: si NR es el 5% del frame, una
 // mejora del 20% en la red se ve como 1% en pantalla. Con timestamps de GPU
 // alrededor de cada etapa se mide lo que realmente cuesta cada una.
+// GPU profiler results surfaced to the overlay (network stage, whole NR pass, peak).
+static float g_ui_net_ms = 0.0f, g_ui_net_peak_ms = 0.0f, g_ui_all_ms = 0.0f;
+
 struct Prof {
     ID3D12QueryHeap *heap = nullptr;
     ID3D12Resource  *rb   = nullptr;      // readback: kSlots x kMarks timestamps
@@ -192,7 +195,7 @@ static bool prof_init(ID3D12Device *dev) {
 }
 
 static inline void prof_mark(ID3D12GraphicsCommandList *cmd, unsigned m) {
-    if (!g_diagnostics || !g_profiling || !g_prof.ready || cmd == nullptr) return;
+    if (!g_profiling || !g_prof.ready || cmd == nullptr) return;
     cmd->EndQuery(g_prof.heap, D3D12_QUERY_TYPE_TIMESTAMP, g_prof.slot * kMarks + m);
 }
 
@@ -205,7 +208,8 @@ static void prof_resolve(ID3D12GraphicsCommandList *cmd) {
 }
 
 static void prof_report() {
-    if (!g_diagnostics) return;   // Map/Unmap per present is not free
+    // The overlay's cost readout depends on this, so it runs regardless of the
+    // diagnostics flag; only the log line is gated. One Map/Unmap of 48 bytes.
     if (!g_profiling || !g_prof.ready || g_prof.freq == 0) return;
     // leer el slot mas viejo: ya se ejecuto seguro
     const unsigned old = (g_prof.slot + 1) % kPSlots;
@@ -235,11 +239,16 @@ static void prof_report() {
     D3D12_RANGE w{ 0, 0 }; g_prof.rb->Unmap(0, &w);
     if (g_prof.samples >= 120) {
         const double n = (double)g_prof.samples;
-        logf("[NRPRE] PERFIL  encode=%.3f  red=%.3f  decode=%.3f  total=%.3f ms  | PICO red=%.3f total=%.3f ms  (n=%u)",
-             g_prof.sum_enc / n, g_prof.sum_net / n, g_prof.sum_dec / n, g_prof.sum_all / n,
-             g_prof.max_net, g_prof.max_all, g_prof.samples);
-        logf("[NRPRE] PERFIL  copias=%.3f ms  PICO copias=%.3f ms",
-             g_prof.sum_snap / n, g_prof.max_snap);
+        g_ui_net_ms      = (float)(g_prof.sum_net / n);
+        g_ui_all_ms      = (float)(g_prof.sum_all / n);
+        g_ui_net_peak_ms = (float)g_prof.max_net;
+        if (g_diagnostics) {
+            logf("[NRPRE] PERFIL  encode=%.3f  red=%.3f  decode=%.3f  total=%.3f ms  | PICO red=%.3f total=%.3f ms  (n=%u)",
+                 g_prof.sum_enc / n, g_prof.sum_net / n, g_prof.sum_dec / n, g_prof.sum_all / n,
+                 g_prof.max_net, g_prof.max_all, g_prof.samples);
+            logf("[NRPRE] PERFIL  copias=%.3f ms  PICO copias=%.3f ms",
+                 g_prof.sum_snap / n, g_prof.max_snap);
+        }
         g_prof.sum_enc = g_prof.sum_net = g_prof.sum_dec = g_prof.sum_all = 0;
         g_prof.max_all = g_prof.max_net = 0;
         g_prof.sum_snap = g_prof.max_snap = 0;
@@ -328,11 +337,17 @@ static void codec_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12Pi
                            ID3D12Resource *, ID3D12Resource *, ID3D12Resource *,
                            ID3D12Resource *, unsigned, unsigned,
                            ID3D12Resource * = nullptr, ID3D12Resource * = nullptr);
+static void guide_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12PipelineState *,
+                           ID3D12Resource *, ID3D12Resource *, DXGI_FORMAT, unsigned, unsigned);
+// Root constants shared by every codec pass; mirrors cbuffer K in codec.hlsl.h.
+struct CodecK {
+    UINT w, h; float pw, ts, cs; UINT hdr; float knee, dclamp;
+    float mvx, mvy, reproj, dreject, sgate, strength, chroma, pad4;
+    UINT nw, nh, fw, fh;
+};
+static const unsigned kCodecConsts = sizeof(CodecK) / 4;
 static void advect_delta(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12Resource *,
                          ID3D12Resource *, ID3D12Resource *, unsigned, unsigned);
-static void snapshot_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *,
-                              ID3D12Resource *, ID3D12Resource *, DXGI_FORMAT,
-                              unsigned, unsigned);
 static void uav_barrier(ID3D12GraphicsCommandList *, ID3D12Resource *);
 static void barrier_transition(ID3D12GraphicsCommandList *, ID3D12Resource *,
                                D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES);
@@ -346,6 +361,28 @@ static float g_knee = 0.75f;           // shoulder start of the development curv
 // Live status shown in the overlay.
 static float g_ui_ms = 0.0f, g_ui_fps = 0.0f, g_ui_nr_hz = 0.0f;
 static float g_ui_base_ms = 0.0f;      // last frame time measured with NR off
+// Hotkeys. The toggle key is the user's; the diagnostic keys (F6/F8/F10/F11) are
+// off by default so they cannot collide with the game's own bindings.
+static int   g_toggle_vk = VK_F7;
+static bool  g_debug_keys = false;
+// Diagnostic view handed to the game instead of the result: 0 result, 1 split,
+// 2 the image the network was given, 3 the network's answer. Not saved.
+static int   g_view = 0;
+// Settings changed outside the overlay (hotkey) are saved on the next present.
+static bool  g_settings_dirty = false;
+// Everything this add-on holds is built for one render resolution. When that
+// changes -- the game's own settings menu, a resolution-scale slider, our own
+// network-resolution slider -- it all has to be rebuilt. Freeing it at the
+// moment we notice is not safe: we notice inside the game's evaluate, on its
+// render thread, with frames still in flight on the GPU that read those very
+// resources. So only a flag is set there, and present does the work once the
+// queue has drained.
+static bool  g_rebuild_pending = false;
+// Another add-on that detours the same NGX entry points cannot coexist with this
+// one, and the failure is not graceful. Set when one is found; see install_hook.
+static bool  g_conflict = false;
+static const char *g_conflict_name = nullptr;
+static reshade::api::effect_runtime *g_rt = nullptr;
 
 static const unsigned kHistBins = 132;   // 0..127 luminance, 128 HDR, 129/130 depth
 
@@ -362,14 +399,41 @@ static const unsigned kHistBins = 132;   // 0..127 luminance, 128 HDR, 129/130 d
 static bool  g_use_exp_tex = true;      // internal: disabled on repeated failure
 static unsigned g_exp_fresh = 0;        // frames since the last game-exposure read
 static bool  g_exp_from_game = false;   // read the game's exposure texture (opt-in: needs its resource state)
-static bool  g_auto_pw = false;            // UI: derive paper white from the scene
+// The game's own statement of how its buffer relates to display range, read from
+// the DLSS parameters every frame. DLSS defines the display-linear image as
+// colour / PreExposure * exposure * ExposureScale, so the buffer value that maps
+// to display white is PreExposure / (exposure * ExposureScale). Both were 1.0 in
+// every game seen so far; they are carried anyway so a game that uses them is
+// not quietly wrong by their ratio.
+static float g_pre_exposure = 1.0f, g_exposure_scale = 1.0f;
+// Reference white from the game's exposure texture where it supplies one, from
+// the scene histogram where it does not. On by default: the fixed value of 1.0
+// was right for one game and wrong by a factor of four for the next.
+static bool  g_auto_pw = true;
 static bool  g_pw_valid = false;
 static unsigned g_pw_updates = 0;
 static float g_pw_measured = 0.0f;
 // Derived alongside paper white from the same histogram -- no extra passes.
 static bool  g_auto_guides = true;     // derive depth convention + HDR + shoulder
-static bool  g_hdr_detected = true;    // latched: proven HDR, never unlatched
+// Whether the buffer the game hands DLSS is scene-linear. Decided by its pixel
+// format, which is the only evidence that cannot lie: a bounded integer format
+// has no room above 1.0, so a game using one is handing over an image that is
+// already display-referred. Counting over-range pixels cannot tell the two
+// apart, because a dark scene in a float buffer never exceeds 1.0 either.
+static bool  g_hdr_detected = true;
 static unsigned g_hdr_samples = 0;
+// How many histogram reads before the depth and shoulder guides have settled.
+static const unsigned kGuideSamples = 400;
+static bool format_is_float(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R11G11B10_FLOAT:    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:          case DXGI_FORMAT_R16_FLOAT:
+        return true;
+    default: return false;
+    }
+}
 static bool  g_depth_reversed = true;  // near geometry sits at the high end
 static bool  g_guides_valid = false;
 static float g_knee_measured = 0.75f;
@@ -378,20 +442,40 @@ static float g_knee_measured = 0.75f;
 // final post block fell through to its simple_blend kernel instead of the
 // mask-aware one. Defaults follow the baseline the community settled on: 1.00
 // across the board, with higher values reported to look worse.
+// Defaults match RenoDX's DLSS 5 add-on as shipped: 1.0 across the strengths,
+// skin following structure, the automatic mask, and the Cinematic style. That
+// is also this add-on's "Reference" preset, so the two agree out of the box and
+// a side-by-side comparison starts from the same place.
 static bool  g_auto_mask = true;        // picks the control_mask kernel path
-static float g_intensity = 1.0f;        // reported as harmful above 1.0
-static float g_local_tone = 0.15f;
-static float g_local_structure = 0.70f;
+static float g_intensity = 1.0f;
+static float g_local_tone = 1.0f;
+static float g_local_structure = 1.0f;
 static float g_skin_structure = -1.0f;  // -1 = leave to the network
-static int   g_style = 0;
-// The network is 4.9 ms of the 8.9 ms frame -- 56% of the budget, measured, and
-// at cadence 2 it lands on every other frame, so the rendered interval swings
-// 8.9/13.9 ms and DLSS-G cannot pace through that. The feature already carries a
-// scaling knob; if it means what it says, running the net below render resolution
-// cuts the cost by area and the delta -- which is low frequency, and already
-// sampled bilinearly -- is the right thing to compute coarsely. 1.0 keeps today's
-// behaviour exactly; try 0.6 and watch PERFIL's red= before trusting it.
+static int   g_style = 1;               // 0 Natural, 1 Cinematic
+// Network resolution, as a fraction of the game's render resolution. The
+// feature's own ScalingRatio knob turned out to be inert (FINDINGS.md), so the
+// scaling is done here: the proxy, the network and the stored delta live on a
+// smaller grid and only the network's change is resampled back up. Cost falls
+// with area; the delta is low frequency and survives the resample. 1.0 keeps
+// the original behaviour exactly.
 static float g_net_scale = 1.0f;
+static unsigned g_lo_w = 0, g_lo_h = 0;   // the network's grid, set at setup
+static bool  g_lo_active = false;          // the grid differs from the render one
+static float g_applied_scale = 1.0f;       // g_net_scale the current state was built for
+// The grid the network runs on for a given render size: even, never tiny.
+static void net_dims(unsigned w, unsigned h, unsigned *nw, unsigned *nh) {
+    float s = g_net_scale;
+    if (s < 0.5f) s = 0.5f;
+    if (s > 1.0f) s = 1.0f;
+    if (s >= 0.995f) { *nw = w; *nh = h; return; }
+    unsigned a = (unsigned)((float)w * s + 0.5f), b = (unsigned)((float)h * s + 0.5f);
+    a = (a + 1u) & ~1u; b = (b + 1u) & ~1u;
+    if (a < 64) a = 64;
+    if (b < 64) b = 64;
+    if (a > w) a = w;
+    if (b > h) b = h;
+    *nw = a; *nh = b;
+}
 // Stage 1 of taking the network off the critical path: it reads our own copies of
 // Color/Depth/MVec instead of the game's textures, still on the graphics queue and
 // still in order. That settles the two unknowns -- whether the copies come out
@@ -498,9 +582,9 @@ static void exp_queue_tick(ID3D12Device *dev, ID3D12CommandQueue *gfx) {
             // dividing by its reciprocal. Independent corroboration: at night the
             // scene histogram lands on 0.100 and this gives 1/11.31 = 0.088.
             if (e > 1e-5f && e < 1e5f) {
-                float pw = 1.0f / e;
-                if (pw < 0.10f) pw = 0.10f;
-                if (pw > 4.0f)  pw = 4.0f;
+                float pw = g_pre_exposure / (e * g_exposure_scale);
+                if (pw < 0.05f) pw = 0.05f;
+                if (pw > 32.0f) pw = 32.0f;
                 g_pw_measured = pw;
                 g_exp_fresh = 0;
                 g_exp_from_game = true;
@@ -589,6 +673,10 @@ struct Codec {
     ID3D12Resource *delta2 = nullptr;   // ping-pong: advection cannot read and write one texture
     ID3D12Resource *snap_color = nullptr, *snap_depth = nullptr, *snap_mv = nullptr;
     bool snap_ready = false;
+    // The network's guides on its own smaller grid, when it runs below render
+    // resolution: depth point-sampled, motion vectors shrunk to that grid.
+    ID3D12PipelineState *pso_down = nullptr, *pso_down_mv = nullptr;
+    ID3D12Resource *lo_depth = nullptr, *lo_mv = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
     ID3D12Resource *proxy = nullptr, *final_tex = nullptr;
     ID3D12Resource *delta = nullptr;      // what the network added, reused on skipped frames
@@ -694,6 +782,17 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
     if (FAILED(hsnap))
         logf("[NRPRE] codec: CSSnapshot failed 0x%08lX (async path unavailable)",
              (unsigned long)hsnap);
+    ID3DBlob *down_cs = nullptr, *down_mv_cs = nullptr;
+    HRESULT hdown = D3DCompileFn(kCodecHLSL, strlen(kCodecHLSL), "codec", nullptr, nullptr,
+                                 "CSDownsample", "cs_5_0", 0, 0, &down_cs, &err);
+    if (FAILED(hdown))
+        logf("[NRPRE] codec: CSDownsample failed 0x%08lX %s", (unsigned long)hdown,
+             err ? (const char *)err->GetBufferPointer() : "");
+    HRESULT hdownmv = D3DCompileFn(kCodecHLSL, strlen(kCodecHLSL), "codec", nullptr, nullptr,
+                                   "CSDownsampleMV", "cs_5_0", 0, 0, &down_mv_cs, &err);
+    if (FAILED(hdownmv))
+        logf("[NRPRE] codec: CSDownsampleMV failed 0x%08lX %s", (unsigned long)hdownmv,
+             err ? (const char *)err->GetBufferPointer() : "");
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -709,7 +808,7 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
     rp[0].DescriptorTable.pDescriptorRanges = ranges;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[1].Constants.ShaderRegister = 0; rp[1].Constants.Num32BitValues = 16;
+    rp[1].Constants.ShaderRegister = 0; rp[1].Constants.Num32BitValues = kCodecConsts;
     rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsd{};
@@ -769,6 +868,18 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
     if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_apply)))) {
         logf("[NRPRE] codec: apply PSO failed"); return false;
     }
+    if (down_cs != nullptr) {
+        pd.CS.pShaderBytecode = down_cs->GetBufferPointer();
+        pd.CS.BytecodeLength  = down_cs->GetBufferSize();
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_down))))
+            logf("[NRPRE] codec: downsample PSO failed (network resolution stays 100%%)");
+    }
+    if (down_mv_cs != nullptr) {
+        pd.CS.pShaderBytecode = down_mv_cs->GetBufferPointer();
+        pd.CS.BytecodeLength  = down_mv_cs->GetBufferSize();
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_cx.pso_down_mv))))
+            logf("[NRPRE] codec: downsample MV PSO failed (network resolution stays 100%%)");
+    }
 
     // histogram buffer (GPU) + readback buffer (CPU) + fence to know when it landed
     {
@@ -809,14 +920,22 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
         dev->CreateUnorderedAccessView(g_cx.hist, nullptr, &hv, heap_cpu(g_cx.clear_heap));
     }
 
-    g_cx.proxy     = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    // The proxy and the delta live on the network's grid; the final image on the
+    // game's. When the two grids match this is exactly what it always was.
+    const bool lo = g_lo_w != 0 && g_lo_h != 0 && (g_lo_w != w || g_lo_h != h);
+    const unsigned lw = lo ? g_lo_w : w, lh = lo ? g_lo_h : h;
+    g_cx.proxy     = make_uav_tex(dev, lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT);
     g_cx.final_tex = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
     // signed: the delta is a difference and goes negative wherever NR darkens
-    g_cx.delta = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    g_cx.delta2 = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    g_cx.delta = make_uav_tex(dev, lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    g_cx.delta2 = make_uav_tex(dev, lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    if (lo && g_cx.pso_down && g_cx.pso_down_mv) {
+        g_cx.lo_depth = make_uav_tex(dev, lw, lh, DXGI_FORMAT_R32_FLOAT);
+        g_cx.lo_mv    = make_uav_tex(dev, lw, lh, DXGI_FORMAT_R16G16_FLOAT);
+    }
     g_cx.ready = (g_cx.proxy && g_cx.final_tex && g_cx.delta);
-    logf("[NRPRE] codec: ready=%d proxy=%p final=%p", (int)g_cx.ready,
-         (void *)g_cx.proxy, (void *)g_cx.final_tex);
+    logf("[NRPRE] codec: ready=%d proxy=%p final=%p network grid=%ux%u of %ux%u",
+         (int)g_cx.ready, (void *)g_cx.proxy, (void *)g_cx.final_tex, lw, lh, w, h);
     return g_cx.ready;
 }
 static bool g_want_hi = false;   // F8 asks for the output-res feature; built on demand
@@ -834,7 +953,10 @@ static NVSDK_NGX_Handle *g_nr_handle_hi = nullptr;
 static ID3D12Resource   *g_nr_out_hi = nullptr;
 static NVSDK_NGX_Parameter *g_nr_params_hi = nullptr;
 static bool              g_use_hi = false;        // F8
-static int               g_repeat = 1;            // F9: run NR N times per frame
+// How many times the network runs per frame. Above one, each pass reads what the
+// last one wrote, so the effect compounds instead of repeating identical work.
+static int               g_passes = 1;
+static ID3D12Resource   *g_nr_out2 = nullptr;     // ping-pong target for pass 2 onwards
 static bool              g_rebind = true;         // F10: feed NR output into DLSS (visible)
 // Every frame is the default: since the cadence anchors on the jitter, this is one
 // NR pass per frame in the pass that is actually shown. The old evaluate counter ran
@@ -1141,9 +1263,52 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             D3D12_RESOURCE_DESC od{};
             if (o && res_desc(o, &od)) { g_out_w = (unsigned)od.Width; g_out_h = od.Height; }
         }
+        // The colour texture the game hands DLSS. Two things want it: the render
+        // resolution when the game declares no sub-rectangle, and the grid the
+        // network runs on when it is scaled below that.
+        unsigned cw = 0, ch = 0;
+        {
+            ID3D12Resource *c = nullptr;
+            if (g_ptr_slot >= 0)
+                param_get_slot(params, (unsigned)g_ptr_slot, NVSDK_NGX_Parameter_Color,
+                               reinterpret_cast<void **>(&c));
+            D3D12_RESOURCE_DESC cd{};
+            if (c && res_desc(c, &cd)) { cw = (unsigned)cd.Width; ch = cd.Height; }
+        }
+        // Not every game states a render sub-rectangle. Control declares none at
+        // all, and treating that as "no dimensions" meant the network was never
+        // created and the add-on did nothing at all. The colour texture is
+        // already sized to the render resolution, so it answers the same
+        // question; the sub-rectangle is only better when it disagrees.
+        if ((rw == 0 || rh == 0) && cw > 0 && ch > 0) {
+            if (!g_setup_done)
+                logf("[NRPRE] no render subrect declared; taking %ux%u from the colour texture",
+                     cw, ch);
+            rw = cw; rh = ch;
+        }
         if (!g_setup_done)
             logf("[NRPRE] setup gate: rw=%u rh=%u cmd=%p", rw, rh, (void *)cmd);
-        if (rw > 0 && rh > 0) setup_nr(rw, rh, cmd);
+        if (rw > 0 && rh > 0 && !g_setup_done) {
+            g_applied_scale = g_net_scale;
+            if (g_net_scale < 0.995f) {
+                // Size the network's grid from the colour texture it will read,
+                // not from the sub-rectangle: those differ by a couple of padding
+                // pixels in some games, and a grid built on the wrong one maps
+                // back onto the frame slightly askew.
+                const unsigned bw = cw ? cw : rw, bh = ch ? ch : rh;
+                unsigned nw = bw, nh = bh;
+                net_dims(bw, bh, &nw, &nh);
+                g_lo_w = nw; g_lo_h = nh;
+                logf("[NRPRE] network resolution %.0f%%: %ux%u of %ux%u",
+                     g_net_scale * 100.0f, nw, nh, bw, bh);
+                setup_nr(nw, nh, cmd);
+            } else {
+                // 100%: no second grid at all, so every pass runs exactly as it
+                // did before the setting existed.
+                g_lo_w = g_lo_h = 0;
+                setup_nr(rw, rh, cmd);
+            }
+        }
     }
     // ---- 2c: run NR at render resolution on the DLSS input colour, discard result ----
     if (g_nr_enabled && g_nr_handle && g_nr_out && g_snip_eval && params) {
@@ -1159,8 +1324,35 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         unsigned w_net = 0, h_net = 0;
         {
             D3D12_RESOURCE_DESC sd{};
-            if (src && res_desc(src, &sd)) { w_net = (unsigned)sd.Width; h_net = sd.Height; }
+            if (src && res_desc(src, &sd)) {
+                w_net = (unsigned)sd.Width; h_net = sd.Height;
+                // The colour format settles whether this buffer is scene-linear.
+                const bool hdr_capable = format_is_float(sd.Format);
+                if (hdr_capable != g_hdr_detected) {
+                    g_hdr_detected = hdr_capable;
+                    logf("[NRPRE] colour buffer format %d: %s", (int)sd.Format,
+                         hdr_capable ? "float, developing as scene-linear HDR"
+                                     : "bounded, already display-referred (passed through)");
+                }
+            }
         }
+        // The render resolution changed under us, or a rebuild is already
+        // queued. Either way nothing we hold matches this frame, so hand it to
+        // the game untouched. Tearing down here is what crashed: the rest of
+        // this function then ran on a released feature and freed textures.
+        if (w_net != 0 && g_net_w != 0 && (w_net != g_net_w || h_net != g_net_h)
+            && !g_rebuild_pending) {
+            g_rebuild_pending = true;
+            logf("[NRPRE] render resolution %ux%u -> %ux%u; rebuilding at present",
+                 g_net_w, g_net_h, w_net, h_net);
+        }
+        if (g_rebuild_pending) return t_orig_eval(cmd, feat, params, cb);
+
+        // The grid the network, proxy and delta live on. lw/lh is that grid;
+        // w_net/h_net stays the game's render grid for everything full-size.
+        const bool lo_active = g_lo_w != 0 && g_lo_h != 0 && (g_lo_w != w_net || g_lo_h != h_net);
+        g_lo_active = lo_active;
+        const unsigned lw = lo_active ? g_lo_w : w_net, lh = lo_active ? g_lo_h : h_net;
         ID3D12Resource *dst_col = nullptr;
         if (g_use_hi && g_ptr_slot >= 0)
             param_get_slot(params, (unsigned)g_ptr_slot, NVSDK_NGX_Parameter_Output,
@@ -1175,7 +1367,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
 
         if (in && dep && mv) {
             ID3D12Resource *net_color = in, *net_depth = dep, *net_mv = mv;
-            if (g_async_net && g_cx.pso_snap != nullptr && dep != nullptr && mv != nullptr) {
+            if (g_async_net && !lo_active && g_cx.pso_snap != nullptr && dep != nullptr && mv != nullptr) {
                 if (!g_cx.snap_ready) {
                     g_cx.snap_color = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R16G16B16A16_FLOAT);
                     g_cx.snap_depth = make_uav_tex(g_device, w_net, h_net, DXGI_FORMAT_R32_FLOAT);
@@ -1185,12 +1377,12 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 }
                 if (g_cx.snap_ready) {
                     prof_mark(cmd, 4);
-                    snapshot_dispatch(cmd, g_device, in,  g_cx.snap_color,
-                                      DXGI_FORMAT_R16G16B16A16_FLOAT, w_net, h_net);
-                    snapshot_dispatch(cmd, g_device, dep, g_cx.snap_depth,
-                                      DXGI_FORMAT_R32_FLOAT, w_net, h_net);
-                    snapshot_dispatch(cmd, g_device, mv,  g_cx.snap_mv,
-                                      DXGI_FORMAT_R16G16_FLOAT, w_net, h_net);
+                    guide_dispatch(cmd, g_device, g_cx.pso_snap, in,  g_cx.snap_color,
+                                   DXGI_FORMAT_R16G16B16A16_FLOAT, w_net, h_net);
+                    guide_dispatch(cmd, g_device, g_cx.pso_snap, dep, g_cx.snap_depth,
+                                   DXGI_FORMAT_R32_FLOAT, w_net, h_net);
+                    guide_dispatch(cmd, g_device, g_cx.pso_snap, mv,  g_cx.snap_mv,
+                                   DXGI_FORMAT_R16G16_FLOAT, w_net, h_net);
                     uav_barrier(cmd, g_cx.snap_color);
                     uav_barrier(cmd, g_cx.snap_depth);
                     uav_barrier(cmd, g_cx.snap_mv);
@@ -1255,20 +1447,25 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 pset_f(pp, "DLSSNR.LocalToneStrength", g_local_tone);
                 pset_f(pp, "DLSSNR.LocalStructureStrength", g_local_structure);
                 pset_f(pp, "DLSSNR.SkinStructureStrength", g_skin_structure);
-                if (g_eval_logged < 3)
-                            {
+                {
                     // DLSS solves this exact problem by having the game hand it the
-                    // exposure it already computed. If GTA V supplies it, that beats
-                    // any histogram estimate we could make.
+                    // exposure it already computed. Where a game supplies it, that
+                    // beats any histogram estimate we could make. The two scalars
+                    // are read every frame; they are what the exposure texture is
+                    // interpreted against.
                     float pre = -1.0f, escale = -1.0f;
-                    void *etex = nullptr;
                     reinterpret_cast<PFN_GF>(vt[14])(params, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &pre);
                     reinterpret_cast<PFN_GF>(vt[14])(params, NVSDK_NGX_Parameter_DLSS_Exposure_Scale, &escale);
-                    if (g_ptr_slot >= 0)
-                        param_get_slot(params, (unsigned)g_ptr_slot,
-                                       NVSDK_NGX_Parameter_ExposureTexture, &etex);
-                    logf("[NRPRE] exposure: PreExposure=%.4f Scale=%.4f ExposureTexture=%p",
-                         pre, escale, etex);
+                    g_pre_exposure   = (pre    > 1e-6f && pre    < 1e6f) ? pre    : 1.0f;
+                    g_exposure_scale = (escale > 1e-6f && escale < 1e6f) ? escale : 1.0f;
+                    if (g_eval_logged < 3) {
+                        void *etex = nullptr;
+                        if (g_ptr_slot >= 0)
+                            param_get_slot(params, (unsigned)g_ptr_slot,
+                                           NVSDK_NGX_Parameter_ExposureTexture, &etex);
+                        logf("[NRPRE] exposure: PreExposure=%.4f Scale=%.4f ExposureTexture=%p",
+                             pre, escale, etex);
+                    }
                 }
                 if (g_eval_logged < 3)
                     logf("[NRPRE] guides: MVecScale=(%.3f, %.3f) reset=%u", msx, msy, rst);
@@ -1319,49 +1516,98 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             const bool use_codec = g_codec_on && !hi && g_device != nullptr
                                    && codec_init(g_device, w_net, h_net);
+            // A smaller network grid only exists through the codec: without it the
+            // feature would be handed full-size textures it was not created for.
+            if (lo_active && !use_codec) return t_orig_eval(cmd, feat, params, cb);
 
             const D3D12_RESOURCE_STATES kUAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             const D3D12_RESOURCE_STATES kSRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
             // Every one of our textures starts and ends each frame in UAV state,
             // so the sequence below is self-contained and safe to toggle at will.
-            // Rebuild if the device changed under us, or the render target resized.
-            if (w_net != 0 && (w_net != g_net_w || h_net != g_net_h)) {
-                if (g_net_w != 0) release_state("render resolution changed");
-                g_net_w = w_net; g_net_h = h_net;
-            }
+            // A size change was caught above and never reaches here, so this only
+            // records the size the first time round.
+            if (w_net != 0) { g_net_w = w_net; g_net_h = h_net; }
 
-            if (use_codec && g_auto_pw && run_now) {
+            // The histogram serves two masters. It measures exposure, which only
+            // matters when the user asked for automatic paper white, and it
+            // derives the guides -- whether the buffer is high dynamic range and
+            // which way depth runs -- which the codec needs to be correct at all.
+            // Gating the whole thing on automatic exposure left those guides
+            // undetermined whenever it was off, so the codec fell back to
+            // assuming scene-linear HDR and reversed depth in every game.
+            if (use_codec && run_now) {
+                const bool guides_wanted = !g_guides_valid || g_hdr_samples < kGuideSamples;
                 ID3D12Resource *etex = nullptr;
-                if (g_ptr_slot >= 0)
+                if (g_auto_pw && g_ptr_slot >= 0)
                     param_get_slot(params, (unsigned)g_ptr_slot,
                                    NVSDK_NGX_Parameter_ExposureTexture,
                                    reinterpret_cast<void **>(&etex));
-                if (etex != nullptr && g_use_exp_tex) g_pending_exp_tex = etex;
-                else record_exposure_sample(cmd, g_device, in, dep, w_net, h_net);
+                if (etex != nullptr && g_use_exp_tex && !guides_wanted)
+                    g_pending_exp_tex = etex;     // the game's own number beats an estimate
+                else if (g_auto_pw || guides_wanted)
+                    record_exposure_sample(cmd, g_device, in, dep, w_net, h_net);
             }
 
             if (run_now) {
                 prof_init(g_device);
                 prof_mark(cmd, 0);
+                const bool lo_guides = lo_active && g_cx.lo_depth != nullptr && g_cx.lo_mv != nullptr;
                 if (use_codec) {
-                    // scene-linear HDR -> bounded sRGB proxy that DLSSNR expects
+                    // scene-linear HDR -> bounded sRGB proxy that DLSSNR expects,
+                    // on the network's grid (resampled down when it is smaller)
                     codec_dispatch(cmd, g_device, g_cx.pso_enc, in, nullptr, nullptr,
-                                   g_cx.proxy, w_net, h_net);
+                                   g_cx.proxy, lw, lh);
                     uav_barrier(cmd, g_cx.proxy);
                     barrier_transition(cmd, g_cx.proxy, kUAV, kSRV);   // NGX reads inputs as SRV
                     pset_res(pp, "DLSSNR.Color", g_cx.proxy);
+                    if (lo_guides) {
+                        // The guides have to match the colour's grid: depth point-
+                        // sampled, motion vectors shrunk to the smaller grid's pixels.
+                        guide_dispatch(cmd, g_device, g_cx.pso_down, dep, g_cx.lo_depth,
+                                       DXGI_FORMAT_R32_FLOAT, lw, lh);
+                        guide_dispatch(cmd, g_device, g_cx.pso_down_mv, mv, g_cx.lo_mv,
+                                       DXGI_FORMAT_R16G16_FLOAT, lw, lh);
+                        uav_barrier(cmd, g_cx.lo_depth);
+                        uav_barrier(cmd, g_cx.lo_mv);
+                        barrier_transition(cmd, g_cx.lo_depth, kUAV, kSRV);
+                        barrier_transition(cmd, g_cx.lo_mv,    kUAV, kSRV);
+                        pset_res(pp, "DLSSNR.Depth", g_cx.lo_depth);
+                        pset_res(pp, "DLSSNR.MVec",  g_cx.lo_mv);
+                    }
                 } else {
                     pset_res(pp, "DLSSNR.Color", in);
                 }
 
-                // The braces are load-bearing: without them the loop covered only the
-                // first mark and the evaluate ran once regardless of g_repeat.
-                for (int k = 0; k < g_repeat; ++k) {
-                    prof_mark(cmd, 1);
-                    er = g_snip_eval(cmd, hh, pp, nullptr);
-                    prof_mark(cmd, 2);
+                // Extra passes need somewhere to write that is not what they are
+                // reading, and it has to match the output the feature was built
+                // for rather than this frame's grid, which can differ by a couple
+                // of padding pixels.
+                if (g_passes > 1 && !hi && g_nr_out2 == nullptr && g_device != nullptr && out != nullptr) {
+                    D3D12_RESOURCE_DESC od{};
+                    if (res_desc(out, &od))
+                        g_nr_out2 = make_uav_tex(g_device, (unsigned)od.Width, od.Height, od.Format);
                 }
+                prof_mark(cmd, 1);
+                er = g_snip_eval(cmd, hh, pp, nullptr);
+                // Each further pass feeds the last answer back in as the colour.
+                // Simply calling evaluate again, as this used to, changed nothing
+                // between iterations and so produced the same image at N times the
+                // cost. Reading its own output is what makes a second pass mean
+                // something: detail the first pass invented becomes input the
+                // second treats as real, which is why it compounds quickly.
+                if (g_passes > 1 && !hi && g_nr_out2 != nullptr) {
+                    ID3D12Resource *spare = g_nr_out2;
+                    for (int k = 1; k < g_passes && er == NVSDK_NGX_Result_Success; ++k) {
+                        barrier_transition(cmd, out, kUAV, kSRV);
+                        pset_res(pp, "DLSSNR.Color",  out);
+                        pset_res(pp, "DLSSNR.Output", spare);
+                        er = g_snip_eval(cmd, hh, pp, nullptr);
+                        barrier_transition(cmd, out, kSRV, kUAV);
+                        ID3D12Resource *t = out; out = spare; spare = t;
+                    }
+                }
+                prof_mark(cmd, 2);
                 if (g_async_net && g_cx.snap_ready) {
                     // back to UAV so the next frame's snapshot can write them again
                     barrier_transition(cmd, g_cx.snap_color,
@@ -1385,7 +1631,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                                       && g_delta_valid && g_skip_n > 1;
                     if (uniform) {
                         if (g_delta_advect)
-                            advect_delta(cmd, g_device, in, mv, dep, w_net, h_net);
+                            advect_delta(cmd, g_device, in, mv, dep, lw, lh);
                         barrier_transition(cmd, g_cx.delta, kUAV, kSRV);
                         codec_dispatch(cmd, g_device, g_cx.pso_apply, in, g_cx.proxy,
                                        g_cx.delta, g_cx.final_tex, w_net, h_net, mv, dep);
@@ -1397,15 +1643,21 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                         uav_barrier(cmd, g_cx.final_tex);
                     }
                     // Capture what the network changed, while both inputs are still SRV.
+                    // The depth stored with it is on the delta's own grid.
                     if (g_delta_reuse && g_skip_n > 1) {
                         codec_dispatch(cmd, g_device, g_cx.pso_delta, in, g_cx.proxy, out,
-                                       g_cx.delta, w_net, h_net, nullptr, dep);
+                                       g_cx.delta, lw, lh, nullptr,
+                                       lo_guides ? g_cx.lo_depth : dep);
                         uav_barrier(cmd, g_cx.delta);
                         g_delta_valid = true;
                         g_delta_age = 1;   // fresh again
                     }
                     barrier_transition(cmd, g_cx.proxy, kSRV, kUAV);   // restore for next frame
                     barrier_transition(cmd, out,        kSRV, kUAV);
+                    if (lo_guides) {
+                        barrier_transition(cmd, g_cx.lo_depth, kSRV, kUAV);
+                        barrier_transition(cmd, g_cx.lo_mv,    kSRV, kUAV);
+                    }
                     g_final_valid = true;         // only now does final_tex hold an image
                 }
                 prof_mark(cmd, 3);
@@ -1415,10 +1667,10 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 // effect to it. No network, so the saving stands, but the image being
                 // handed on is built from this frame rather than the previous one.
                 codec_dispatch(cmd, g_device, g_cx.pso_enc, in, nullptr, nullptr,
-                               g_cx.proxy, w_net, h_net);
+                               g_cx.proxy, lw, lh);
                 uav_barrier(cmd, g_cx.proxy);
                 barrier_transition(cmd, g_cx.proxy, kUAV, kSRV);
-                if (g_delta_advect) advect_delta(cmd, g_device, in, mv, dep, w_net, h_net);
+                if (g_delta_advect) advect_delta(cmd, g_device, in, mv, dep, lw, lh);
                 barrier_transition(cmd, g_cx.delta, kUAV, kSRV);
                 codec_dispatch(cmd, g_device, g_cx.pso_apply, in, g_cx.proxy, g_cx.delta,
                                g_cx.final_tex, w_net, h_net, mv, dep);
@@ -1741,8 +1993,8 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
 
     pset_u(g_nr_params, "DLSSNR.Hint.Render.Preset", 0);
     pset_u(g_nr_params, "DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
-    pset_f(g_nr_params, "DLSSNR.ScalingRatio", g_net_scale);
-    logf("[NRPRE] 2b: ScalingRatio=%.3f (1.0 = misma resolucion dentro y fuera)", g_net_scale);
+    // The feature's own ratio is inert; the network grid is scaled by this addon.
+    pset_f(g_nr_params, "DLSSNR.ScalingRatio", 1.0f);
     pset_u(g_nr_params, "DLSSNR.UseAutoMask", g_auto_mask ? 1u : 0u);
     pset_u(g_nr_params, "DLSSNR.Style", (unsigned)g_style);
     pset_u(g_nr_params, "CreationNodeMask", 1);
@@ -1908,24 +2160,28 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     // Bias rides on the measured value, then is held inside the range the
     // measurement itself is clamped to.
     float pw_effective = g_paper_white / (g_input_gain > 0.01f ? g_input_gain : 0.01f);
-    if (pw_effective < 0.10f) pw_effective = 0.10f;
-    if (pw_effective > 4.00f) pw_effective = 4.00f;
-    struct { UINT w, h; float pw, ts, cs; UINT hdr; float knee, dclamp;
-             float mvx, mvy, reproj, dreject, sgate, strength, chroma, pad4; } k{
+    if (pw_effective < 0.05f) pw_effective = 0.05f;
+    if (pw_effective > 32.0f) pw_effective = 32.0f;
+    // Size is this dispatch's grid; NetSize/FullSize tell the shader which grid
+    // each texture lives on, so a pass can read across the two.
+    const unsigned fw = g_net_w ? g_net_w : w, fh = g_net_h ? g_net_h : h;
+    const unsigned nw = g_lo_active ? g_lo_w : fw, nh = g_lo_active ? g_lo_h : fh;
+    CodecK k{
         w, h, pw_effective, g_transfer, g_color_strength, hdr_mode, g_knee, g_delta_clamp,
         g_mv_scale_x, g_mv_scale_y,
         // advected: it is already in place, so do not move it again
         (g_delta_advect && g_cx.pso_advect) ? 0.0f
             : (g_delta_age_scale ? g_reproject * (float)g_delta_age : g_reproject),
         g_depth_reject, g_struct_gate,
-        g_effect_strength, g_chroma_transfer, 0.0f };
+        g_effect_strength, g_chroma_transfer, (float)g_view,
+        nw, nh, fw, fh };
 
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(g_cx.root);
     cmd->SetPipelineState(pso);
     cmd->SetComputeRootDescriptorTable(0, gpu);
-    cmd->SetComputeRoot32BitConstants(1, 16, &k, 0);
+    cmd->SetComputeRoot32BitConstants(1, kCodecConsts, &k, 0);
     cmd->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
 }
 
@@ -1935,12 +2191,13 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
 // for colour and wrong for a single-channel depth or a two-channel motion vector.
 // Everything else -- the ring slot, the root signature, the SRV format mapping --
 // is deliberately the same, so this stays one small departure and not a fork.
-static void snapshot_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
-                              ID3D12Resource *srcTex, ID3D12Resource *dstTex,
-                              DXGI_FORMAT uav_fmt, unsigned w, unsigned h)
+static void guide_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
+                           ID3D12PipelineState *pso,
+                           ID3D12Resource *srcTex, ID3D12Resource *dstTex,
+                           DXGI_FORMAT uav_fmt, unsigned w, unsigned h)
 {
     if (cmd == nullptr || dev == nullptr || srcTex == nullptr || dstTex == nullptr) return;
-    if (g_cx.pso_snap == nullptr || g_cx.heap == nullptr) return;
+    if (pso == nullptr || g_cx.heap == nullptr) return;
     const unsigned slot = g_cx.slot;
     g_cx.slot = (g_cx.slot + 1) % kCxSlots;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_cpu(g_cx.heap);
@@ -1980,13 +2237,16 @@ static void snapshot_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     D3D12_CPU_DESCRIPTOR_HANDLE uh1 = cpu; uh1.ptr += (SIZE_T)6 * g_cx.inc;
     dev->CreateUnorderedAccessView(dstTex, nullptr, &ud, uh1);
 
-    struct { UINT w, h; float f[14]; } k{}; k.w = w; k.h = h;
+    const unsigned fw = g_net_w ? g_net_w : w, fh = g_net_h ? g_net_h : h;
+    CodecK k{}; k.w = w; k.h = h;
+    k.nw = g_lo_active ? g_lo_w : fw; k.nh = g_lo_active ? g_lo_h : fh;
+    k.fw = fw; k.fh = fh;
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(g_cx.root);
-    cmd->SetPipelineState(g_cx.pso_snap);
+    cmd->SetPipelineState(pso);
     cmd->SetComputeRootDescriptorTable(0, gpu);
-    cmd->SetComputeRoot32BitConstants(1, 16, &k, 0);
+    cmd->SetComputeRoot32BitConstants(1, kCodecConsts, &k, 0);
     cmd->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
 }
 
@@ -2024,6 +2284,10 @@ static void uav_barrier(ID3D12GraphicsCommandList *cmd, ID3D12Resource *res) {
 // ReShade keeps one ReShade.ini per game, so this is per-game config for free.
 static void load_settings(reshade::api::effect_runtime *rt) {
     int v = 0; float f = 0.0f;
+    g_rt = rt;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "ToggleKey", v))
+        g_toggle_vk = (v >= VK_F1 && v <= VK_F12) ? v : VK_F7;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "DebugKeys", v))     g_debug_keys = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "Enabled", v))       g_nr_enabled = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "AsyncNetwork", v)) g_async_net = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "StallMs", v)) g_stall_ms = (v < 1 ? 1 : (v > 500 ? 500 : v));
@@ -2032,8 +2296,10 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAdvect", v)) g_delta_advect = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "DeltaAgeScale", v)) g_delta_age_scale = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "NetScale", f))
-        g_net_scale = (f < 0.25f ? 0.25f : (f > 1.0f ? 1.0f : f));
+        g_net_scale = (f < 0.5f ? 0.5f : (f > 1.0f ? 1.0f : f));
     if (reshade::get_config_value(rt, "NRPreUpscale", "Cadence", v))       g_skip_n = (v < 1 ? 1 : (v > 3 ? 3 : v));
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Passes", v))        g_passes = (v < 1 ? 1 : (v > 3 ? 3 : v));
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Style", v))         g_style = (v == 1) ? 1 : 0;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Codec", v))         g_codec_on = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoMask", v)) g_auto_mask = (v != 0);
     // ReShade re-creates the effect runtime several times per session; do not let
@@ -2062,6 +2328,9 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     logf("[NRPRE] settings loaded: enabled=%d cadence=%d codec=%d pw=%.3f knee=%.2f",
          (int)g_nr_enabled, g_skip_n, (int)g_codec_on, g_paper_white, g_knee);
 }
+static void on_destroy_effect_runtime(reshade::api::effect_runtime *rt) {
+    if (g_rt == rt) g_rt = nullptr;
+}
 // Paper white shifts what the network is shown, so a preset nudges it rather than
 // setting it: auto exposure owns the absolute value, this only biases it.
 static void apply_preset(int p) {
@@ -2085,8 +2354,12 @@ static void apply_preset(int p) {
 }
 
 static void save_settings(reshade::api::effect_runtime *rt) {
+    reshade::set_config_value(rt, "NRPreUpscale", "ToggleKey", g_toggle_vk);
+    reshade::set_config_value(rt, "NRPreUpscale", "DebugKeys", g_debug_keys ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "Enabled", g_nr_enabled ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "Cadence", g_skip_n);
+    reshade::set_config_value(rt, "NRPreUpscale", "Passes", g_passes);
+    reshade::set_config_value(rt, "NRPreUpscale", "Style", g_style);
     reshade::set_config_value(rt, "NRPreUpscale", "NetScale", g_net_scale);
     reshade::set_config_value(rt, "NRPreUpscale", "AsyncNetwork", g_async_net ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "UniformDelta", g_uniform_delta ? 1 : 0);
@@ -2116,90 +2389,295 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "AutoPaperWhite", g_auto_pw ? 1 : 0);
 }
 
+// ---- what the network costs at a given size ---------------------------------
+// Not proportional to pixel count, which is what this panel used to assume.
+// Measured here: nine times fewer pixels ran only about four times faster, so a
+// fixed per-invocation cost dominates once the grid is small. Two sizes pin down
+// both terms. Until a second size has been seen there is nothing to fit, and the
+// panel says the numbers are assumed rather than measured.
+struct CostSample { double px, ms; };
+static CostSample g_cost[8];
+static unsigned   g_cost_n = 0;
+
+static void cost_record(double px, double ms) {
+    if (px < 1.0 || ms <= 0.0) return;
+    for (unsigned i = 0; i < g_cost_n; ++i)
+        if (g_cost[i].px == px) { g_cost[i].ms = ms; return; }    // same size: refresh
+    if (g_cost_n < 8) { g_cost[g_cost_n].px = px; g_cost[g_cost_n].ms = ms; ++g_cost_n; }
+    else              { g_cost[7].px = px;        g_cost[7].ms = ms; }
+}
+
+// Least squares through every size seen this session: ms = fixed + per_px * px.
+static bool cost_fit(double *fixed, double *per_px) {
+    if (g_cost_n < 2) return false;
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (unsigned i = 0; i < g_cost_n; ++i) {
+        sx  += g_cost[i].px;                sy  += g_cost[i].ms;
+        sxx += g_cost[i].px * g_cost[i].px; sxy += g_cost[i].px * g_cost[i].ms;
+    }
+    const double n = (double)g_cost_n;
+    const double den = n * sxx - sx * sx;
+    if (den <= 0.0) return false;
+    const double slope = (n * sxy - sx * sy) / den;
+    if (slope <= 0.0) return false;          // noise, not a size relationship
+    *per_px = slope;
+    *fixed  = (sy - slope * sx) / n;
+    if (*fixed < 0.0) *fixed = 0.0;
+    return true;
+}
+
+static double cost_estimate(double px) {
+    double f = 0.0, p = 0.0;
+    if (cost_fit(&f, &p)) return f + p * px;
+    if (g_cost_n >= 1 && g_cost[0].px > 0.0) return g_cost[0].ms * px / g_cost[0].px;
+    return 0.0;
+}
+
 #ifndef NR_STANDALONE
 static void draw_overlay(reshade::api::effect_runtime *rt) {
     bool changed = false;
+    const ImVec4 kOn  (0.35f, 0.85f, 0.40f, 1.0f);
+    const ImVec4 kOff (0.85f, 0.35f, 0.35f, 1.0f);
+    const ImVec4 kWarn(1.00f, 0.60f, 0.20f, 1.0f);
 
-    changed |= ImGui::Checkbox("Enable DLSS-NR", &g_nr_enabled);
-    ImGui::SetItemTooltip("Runs Neural Rendering on the DLSS input at render resolution, "
-                          "instead of on the DLSS output, then feeds the result back in.");
+    if (g_conflict) {
+        ImGui::TextColored(kOff, "Standing down: %s is also loaded.", g_conflict_name);
+        ImGui::TextDisabled("Two add-ons cannot both hook NVIDIA's neural entry points, and running");
+        ImGui::TextDisabled("both crashes the game. Nothing below is in effect. Remove one of the");
+        ImGui::TextDisabled("two from the game folder and restart.");
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
+
+    // ---- master switch ------------------------------------------------------
+    changed |= ImGui::Checkbox("Neural Rendering", &g_nr_enabled);
+    ImGui::SetItemTooltip("Runs DLSS 5 Neural Rendering on the DLSS input at render resolution, "
+                          "then hands the result to the game's own DLSS upscale.");
+    ImGui::SameLine();
+    if (g_nr_enabled && g_nr_handle != nullptr) ImGui::TextColored(kOn, "ON");
+    else if (g_nr_enabled)                      ImGui::TextColored(kWarn, "ON (waiting for the game to create DLSS)");
+    else                                        ImGui::TextColored(kOff, "OFF");
+
+    {
+        static const char *keys[] = { "F1", "F2", "F3", "F4", "F5", "F6",
+                                      "F7", "F8", "F9", "F10", "F11", "F12" };
+        int ki = g_toggle_vk - VK_F1;
+        if (ki < 0 || ki > 11) ki = 6;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 5.0f);
+        if (ImGui::Combo("Toggle key", &ki, keys, 12)) { g_toggle_vk = VK_F1 + ki; changed = true; }
+        ImGui::SetItemTooltip("Press this key in gameplay to switch Neural Rendering on and off. "
+                              "Pick one the game does not use.");
+    }
+
+    // ---- cost ----------------------------------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("Cost");
+    if (g_ui_fps > 0.0f) ImGui::Text("Frame %.2f ms  (%.0f fps)", g_ui_ms, g_ui_fps);
+    else                 ImGui::TextDisabled("Measuring frame time...");
+
+    const bool have_net = g_net_w > 0 && g_net_h > 0;
+    const unsigned grid_w = g_lo_active ? g_lo_w : g_net_w;
+    const unsigned grid_h = g_lo_active ? g_lo_h : g_net_h;
+    if (g_nr_enabled && have_net && g_ui_net_ms > 0.0f) {
+        if (g_passes > 1)
+            ImGui::Text("Network %.2f ms at %ux%u over %d passes   (peak %.2f ms)",
+                        g_ui_net_ms, grid_w, grid_h, g_passes, g_ui_net_peak_ms);
+        else
+            ImGui::Text("Network %.2f ms per run at %ux%u   (peak %.2f ms)",
+                        g_ui_net_ms, grid_w, grid_h, g_ui_net_peak_ms);
+        ImGui::Text("Neural Rendering per frame: %.2f ms", g_ui_all_ms / (float)g_skip_n);
+        ImGui::SetItemTooltip("Whole pass (colour encode, network, decode) divided by how often it runs.");
+
+        // Because the network runs before the upscale, its cost follows the
+        // game's render resolution. That is the whole point of this placement,
+        // so show what the game's own resolution scale would buy.
+        const bool full = g_net_w >= g_out_w && g_net_h >= g_out_h;
+        const double s = (double)grid_w / (double)g_net_w;   // our own scaling
+        // Samples are stored per pass, so the projection multiplies back up.
+        auto est = [&](double ratio) {
+            return cost_estimate((ratio * s * g_out_w) * (ratio * s * g_out_h))
+                 * (double)(g_passes > 0 ? g_passes : 1);
+        };
+        ImGui::Spacing();
+        if (full) {
+            ImGui::TextColored(kWarn, "The game is rendering at the full %ux%u, so the network sees", g_out_w, g_out_h);
+            ImGui::TextColored(kWarn, "every output pixel. Lower Resolution Scaling in the game's menu,");
+            ImGui::TextDisabled("or use the Network resolution slider below, which works regardless.");
+        } else {
+            ImGui::TextDisabled("Render %ux%u -> output %ux%u", g_net_w, g_net_h, g_out_w, g_out_h);
+        }
+        ImGui::TextDisabled("Cost at other values of the game's Resolution Scaling:");
+        ImGui::TextDisabled("   100%%  (DLAA)           ~%.1f ms", est(1.0));
+        ImGui::TextDisabled("    67%%  (Quality)        ~%.1f ms", est(0.6667));
+        ImGui::TextDisabled("    58%%  (Balanced)       ~%.1f ms", est(0.58));
+        ImGui::TextDisabled("    50%%  (Performance)    ~%.1f ms", est(0.5));
+        ImGui::TextDisabled("    33%%  (Ultra Perf.)    ~%.1f ms", est(0.3333));
+        {
+            double f = 0.0, p = 0.0;
+            if (cost_fit(&f, &p))
+                ImGui::TextDisabled("Fitted from %u sizes measured this session; about %.1f ms of it "
+                                    "does not shrink with resolution.", g_cost_n, f);
+            else
+                ImGui::TextDisabled("Assumes cost scales with area, which understates the small sizes. "
+                                    "Change the resolution once and these become measured.");
+        }
+    } else if (g_nr_enabled) {
+        ImGui::TextDisabled("Network cost appears after a few seconds of gameplay.");
+    }
 
     ImGui::Spacing();
-    ImGui::SeparatorText("Neural rendering");
-    ImGui::TextDisabled("How often it runs");
+    {
+        // A dropdown, not a slider: every distinct value tears the network down
+        // and rebuilds it, which takes a noticeable fraction of a second, so a
+        // slider that passes through twenty values on the way to one is twenty
+        // rebuilds. Fixed steps make each choice a single rebuild.
+        static const float steps[]  = { 1.00f, 0.85f, 0.75f, 0.67f, 0.58f, 0.50f };
+        static const char *labels[] = { "100%", "85%", "75%", "67%", "58%", "50%" };
+        int sel = 0; float best = 9.0f;
+        for (int i = 0; i < 6; ++i) {
+            const float d = fabsf(steps[i] - g_net_scale);
+            if (d < best) { best = d; sel = i; }
+        }
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8.0f);
+        if (ImGui::Combo("Network resolution", &sel, labels, 6)) {
+            g_net_scale = steps[sel];
+            changed = true;
+        }
+        ImGui::SetItemTooltip("The network runs on a copy this much smaller than the game's render "
+                              "resolution, and only its change is applied back at full size. Cost "
+                              "falls with area: 70%% is about half, 50%% about a quarter. Works in "
+                              "DLAA. Below ~65%% fine detail the network adds starts to soften. "
+                              "Applies within a second; the network is recreated.");
+        if (g_lo_active && have_net) {
+            ImGui::TextDisabled("Network grid %ux%u, applied at %ux%u", grid_w, grid_h, g_net_w, g_net_h);
+        } else if (g_net_scale < 0.995f && g_nr_enabled && have_net) {
+            ImGui::TextColored(kWarn, "rebuilding for the new resolution...");
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("How often the network runs");
     int cad = g_skip_n - 1;
-    changed |= ImGui::RadioButton("Quality", &cad, 0);
-    ImGui::SetItemTooltip("The network runs on every frame.");
+    char lbl[3][48];
+    for (int i = 0; i < 3; ++i) {
+        static const char *names[3] = { "Every frame", "Every 2nd", "Every 3rd" };
+        if (g_ui_all_ms > 0.0f)
+            snprintf(lbl[i], sizeof lbl[i], "%s (~%.1f ms)##cad%d", names[i], g_ui_all_ms / (i + 1), i);
+        else
+            snprintf(lbl[i], sizeof lbl[i], "%s##cad%d", names[i], i);
+    }
+    changed |= ImGui::RadioButton(lbl[0], &cad, 0);
+    ImGui::SetItemTooltip("The network runs on every frame. Nothing is reconstructed; this is the reference image.");
     ImGui::SameLine();
-    changed |= ImGui::RadioButton("Balanced", &cad, 1);
-    ImGui::SetItemTooltip("The network runs on every 2nd frame.");
+    changed |= ImGui::RadioButton(lbl[1], &cad, 1);
+    ImGui::SetItemTooltip("Runs every 2nd frame. The frame in between reuses the last effect, moved along the "
+                          "motion vectors. Costs some trailing on moving edges and mild shimmer.");
     ImGui::SameLine();
-    changed |= ImGui::RadioButton("Performance", &cad, 2);
-    ImGui::SetItemTooltip("The network runs on every 3rd frame.");
+    changed |= ImGui::RadioButton(lbl[2], &cad, 2);
+    ImGui::SetItemTooltip("Runs every 3rd frame. Same trailing and shimmer as every-2nd, stronger, since the "
+                          "reused effect is older.");
     g_skip_n = cad + 1;
 
-    // Each mode states what it does and what it costs: the cheaper ones are not
-    // free, they reconstruct the skipped frames and that shows on moving edges.
-    switch (g_skip_n) {
-    case 1:
-        ImGui::TextDisabled("Runs the network on every frame. Nothing is reconstructed.");
-        ImGui::TextDisabled("Side effect: none. This is the reference image.");
-        break;
-    case 2:
-        ImGui::TextDisabled("Runs the network every 2nd frame. The frame in between reuses "
-                            "the last effect, moved along the motion vectors.");
-        ImGui::TextDisabled("Side effect: some trailing at edges that move, and mild shimmer "
-                            "where the reconstruction and the real result differ.");
-        break;
-    default:
-        ImGui::TextDisabled("Runs the network every 3rd frame. Two frames in between reuse an "
-                            "effect that is up to two frames old.");
-        ImGui::TextDisabled("Side effect: the same trailing and shimmer as Balanced, stronger, "
-                            "since the reused effect is older.");
-        break;
-    }
-
+    // ---- look ------------------------------------------------------------------
     ImGui::Spacing();
-    ImGui::TextDisabled("How far it may go");
-    const char *presets[] = { "Custom", "Light", "Moderate", "Reference",
-                              "Overdrive", "AI slop" };
-    if (ImGui::Combo("How transformative", &g_preset, presets, 6)) {
-        apply_preset(g_preset); changed = true;
-    }
-    ImGui::SetItemTooltip("How far the network is allowed to reinterpret the image. "
-                          "Reference is what it produces on its own; the lower settings pull "
-                          "back its micro-detail first, which is where invented texture "
-                          "comes from.");
+    ImGui::SeparatorText("Look");
+    const char *presets[] = { "Custom", "Light", "Moderate", "Reference", "Overdrive", "AI slop" };
+    if (ImGui::Combo("Preset", &g_preset, presets, 6)) { apply_preset(g_preset); changed = true; }
+    ImGui::SetItemTooltip("How far the network is allowed to reinterpret the image. Reference is what it "
+                          "produces on its own; the lower settings pull back its micro-detail first, "
+                          "which is where invented texture comes from.");
     switch (g_preset) {
     case 1: ImGui::TextDisabled("Keeps the lighting work, holds back invented detail."); break;
     case 2: ImGui::TextDisabled("Half way: detail is enhanced but not rebuilt."); break;
-    case 3: ImGui::TextDisabled("Everything the network wants to do. Most detail, most "
-                                "reinterpretation."); break;
-    case 4: ImGui::TextDisabled("Past what the network intends. Detail is pushed until it "
-                                "starts looking drawn rather than photographed."); break;
-    case 5: ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
-                               "Deliberately overcooked. Skin turns waxy and surfaces grow "
-                               "detail that was never in the scene."); break;
-    default: ImGui::TextDisabled("Set by hand in Advanced."); break;
+    case 3: ImGui::TextDisabled("Everything the network wants to do. Most detail, most reinterpretation."); break;
+    case 4: ImGui::TextDisabled("Past what the network intends. Detail is pushed until it starts looking "
+                                "drawn rather than photographed."); break;
+    case 5: ImGui::TextColored(kWarn, "Deliberately overcooked. Skin turns waxy and surfaces grow detail "
+                                      "that was never in the scene."); break;
+    default: ImGui::TextDisabled("Set by hand in Fine tuning below."); break;
     }
 
-    ImGui::TextDisabled("How much of it is kept");
+    {
+        // Two looks the network itself carries, chosen inside the model rather
+        // than blended afterwards. This add-on was fixed to Natural and offered
+        // no way to change it, which is a good part of why it did not match
+        // RenoDX's add-on side by side: that one defaults to Cinematic.
+        const char *styles[] = { "Natural", "Cinematic" };
+        int st = (g_style == 1) ? 1 : 0;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+        if (ImGui::Combo("Style", &st, styles, 2)) { g_style = st; changed = true; }
+        ImGui::SetItemTooltip("A look the network was trained to produce, selected inside the model. "
+                              "Nothing in this panel blends between the two; the network is simply "
+                              "told which one to render. Applies on the next frame.");
+    }
+
     changed |= ImGui::SliderFloat("Effect strength", &g_effect_strength, 0.0f, 2.0f, "%.2f");
-    ImGui::SetItemTooltip("How far to carry the network's result. 0 is the game's own image, "
-                          "1 is the full effect, and above 1 pushes past what the network "
-                          "produced -- which sharpens, and can ring on hard edges. This "
-                          "dilutes everything evenly; the setting above shapes what the "
-                          "network does instead.");
+    ImGui::SetItemTooltip("How much of the network's result is kept. 0 is the game's own image, 1 is the "
+                          "full effect, above 1 pushes past it, which sharpens and can ring on hard edges. "
+                          "This dilutes everything evenly; the preset shapes what the network does instead.");
 
+    {
+        int p = g_passes;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+        if (ImGui::SliderInt("Inference passes", &p, 1, 3)) { g_passes = p; changed = true; }
+        ImGui::SetItemTooltip("Runs the network again on its own output. Each pass costs another "
+                              "full run and compounds rather than amplifies: detail the first pass "
+                              "invented becomes input the second treats as real. Two is already "
+                              "strong, three is a look rather than a fidelity setting.");
+        if (g_passes > 1)
+            ImGui::TextDisabled("Costs %dx the network time. Lower the network resolution or the "
+                                "cadence to pay for it.", g_passes);
+    }
 
+    {
+        const char *views[] = { "Result", "Split: game left, result right",
+                                "What the network was given", "What the network returned" };
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+        ImGui::Combo("View", &g_view, views, 4);
+        ImGui::SetItemTooltip("Diagnostic. Hands the game something other than the result so the "
+                              "colour reconstruction can be judged by eye. Not saved; resets to "
+                              "Result on restart.");
+        if (g_view == 2) {
+            ImGui::TextColored(kWarn, "This is the picture the network sees. It should look like the "
+                                      "game's own frame with the brightest areas softened.");
+            ImGui::TextDisabled("Too dark overall: Paper white is too high. Bright areas flat and "
+                                "washed out: Paper white is too low. Adjust under Exposure, or "
+                                "switch it to Auto.");
+        } else if (g_view == 3) {
+            ImGui::TextDisabled("The network's answer before the range is restored. Compare with the "
+                                "view above to see exactly what it changed.");
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Fine tuning")) {
+        ImGui::TextDisabled("These are the values the preset sets. Moving one switches the preset to Custom.");
+        ImGui::TextDisabled("Not confirmed that the network honours all of them; compare Light against "
+                            "AI slop and judge.");
+        bool net = false;
+        changed |= ImGui::Checkbox("Automatic mask", &g_auto_mask);
+        ImGui::SetItemTooltip("Lets the network decide per pixel where to apply its result. Without it the "
+                              "final blend is uniform.");
+        net |= ImGui::SliderFloat("Intensity", &g_intensity, 0.0f, 2.0f, "%.2f");
+        ImGui::SetItemTooltip("Overall strength of the network's changes. 1 is what NVIDIA ships.");
+        net |= ImGui::SliderFloat("Local tone", &g_local_tone, 0.0f, 2.0f, "%.2f");
+        ImGui::SetItemTooltip("How much it re-lights small areas: shading and contrast within surfaces.");
+        net |= ImGui::SliderFloat("Local structure", &g_local_structure, 0.0f, 2.0f, "%.2f");
+        ImGui::SetItemTooltip("How much micro-detail it adds to surfaces. This is where invented texture "
+                              "comes from.");
+        net |= ImGui::SliderFloat("Skin structure", &g_skin_structure, -1.0f, 2.0f, "%.2f");
+        ImGui::SetItemTooltip("Same as Local structure, but for skin. -1 follows Local structure.");
+        if (net) { g_preset = 0; changed = true; }
+    }
+
+    // ---- exposure --------------------------------------------------------------
     ImGui::Spacing();
     ImGui::SeparatorText("Exposure");
     ImGui::BeginDisabled(!g_codec_on);
     changed |= ImGui::Checkbox("Auto", &g_auto_pw);
     ImGui::SameLine();
     ImGui::TextDisabled("(uses the game's own exposure, or the scene if it has none)");
-    ImGui::SetItemTooltip("Measures the scene's own brightness and sets the reference white "
-                          "from it, instead of a fixed value borrowed from another game.");
+    ImGui::SetItemTooltip("Measures the scene's own brightness and sets the reference white from it, "
+                          "instead of a fixed value.");
     if (g_auto_pw) {
         if (g_pw_valid || g_guides_valid) {
             ImGui::TextDisabled("source: %s", g_exp_from_game ? "game exposure"
@@ -2210,115 +2688,105 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                                 g_hdr_detected ? "HDR (developing)" : "SDR (passthrough)",
                                 g_depth_reversed ? "reversed" : "normal");
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "sampling...");
+            ImGui::TextColored(kWarn, "sampling...");
         }
     }
     ImGui::BeginDisabled(g_auto_pw);
-    changed |= ImGui::SliderFloat("Paper white", &g_paper_white, 0.10f, 2.00f, "%.3f");
-    ImGui::SetItemTooltip("Where the game's reference white lands.");
+    // Logarithmic and wide: games differ by more than an order of magnitude in
+    // what their scene-linear buffer calls white. Alan Wake 2 sits above 4 where
+    // the old 0.1 to 2 range could not reach; Silent Hill 2 sits below 0.5.
+    changed |= ImGui::SliderFloat("Paper white", &g_paper_white, 0.05f, 32.0f, "%.3f",
+                                  ImGuiSliderFlags_Logarithmic);
+    ImGui::SetItemTooltip("The scene-linear value the network is shown as white. Lower shows the "
+                          "network a brighter picture. Use the 'What the network was given' view to "
+                          "judge it, or Auto to take it from the game's own exposure when it "
+                          "provides one.");
     changed |= ImGui::SliderFloat("Shoulder", &g_knee, 0.10f, 0.95f, "%.2f");
-    ImGui::SetItemTooltip("Where highlight roll-off begins.");
+    ImGui::SetItemTooltip("Where highlight roll-off begins. Lower protects bright areas from the network.");
     ImGui::EndDisabled();
     ImGui::EndDisabled();
 
+    // ---- advanced --------------------------------------------------------------
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Advanced")) {
-        ImGui::TextDisabled("Defaults are what the tuning converged on. Change them only to "
-                            "trade one artefact for another.");
+        ImGui::TextDisabled("Defaults are what the tuning converged on. Change them only to trade one "
+                            "artefact for another.");
         ImGui::Spacing();
 
         ImGui::SeparatorText("Colour development");
         changed |= ImGui::Checkbox("Enable codec", &g_codec_on);
-        ImGui::SetItemTooltip("The network expects a bounded, display-referred image and this "
-                              "game hands DLSS a scene-linear HDR buffer, so it is developed "
-                              "first and the range restored afterwards. An SDR buffer is "
-                              "detected and passed through on its own, so turning this off is "
-                              "a diagnostic, not a setting.");
+        ImGui::SetItemTooltip("The network expects a bounded, display-referred image and this game hands "
+                              "DLSS a scene-linear HDR buffer, so it is developed first and the range "
+                              "restored afterwards. An SDR buffer is detected and passed through on its "
+                              "own, so turning this off is a diagnostic, not a setting.");
         changed |= ImGui::SliderFloat("Transfer", &g_transfer, 0.0f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("How much of the development curve to apply before the network "
-                              "sees the image. 1 is the full curve.");
+        ImGui::SetItemTooltip("How much of the development curve to apply before the network sees the "
+                              "image. 1 is the full curve.");
         changed |= ImGui::SliderFloat("Saturation", &g_color_strength, 0.0f, 1.5f, "%.2f");
-        ImGui::SetItemTooltip("1 keeps the colour as developed. Below 1 desaturates toward "
-                              "luminance, above 1 pushes it further.");
+        ImGui::SetItemTooltip("1 keeps the colour as developed. Below 1 desaturates toward luminance, "
+                              "above 1 pushes it further.");
         changed |= ImGui::SliderFloat("Chroma transfer", &g_chroma_transfer, 0.0f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("Restoring the range carries the network's light but not its "
-                              "colour, since hue is preserved exactly by construction. This "
-                              "adopts its colour as well, at the luminance already restored.");
+        ImGui::SetItemTooltip("Restoring the range carries the network's light but not its colour, since "
+                              "hue is preserved exactly by construction. This adopts its colour as well.");
         changed |= ImGui::SliderFloat("Input gain", &g_input_gain, 0.60f, 1.60f, "%.2f");
-        ImGui::SetItemTooltip("How bright the image is when the network sees it. Above 1 shows "
-                              "it a brighter image and it acts harder. Mostly cancels out when "
-                              "the range is restored, so it shows up in the highlights.");
-
+        ImGui::SetItemTooltip("How bright the image is when the network sees it. Above 1 shows it a "
+                              "brighter image and it acts harder. Mostly cancels out when the range is "
+                              "restored, so it shows up in the highlights.");
 
         ImGui::Spacing();
         ImGui::SeparatorText("Skipped-frame reconstruction");
         ImGui::BeginDisabled(g_skip_n <= 1);
         changed |= ImGui::Checkbox("Reuse the network's effect", &g_delta_reuse);
-        ImGui::SetItemTooltip("Stores what the network changed and re-applies it to the current "
-                              "frame instead of reusing the whole stale image.");
+        ImGui::SetItemTooltip("Stores what the network changed and re-applies it to the current frame "
+                              "instead of reusing the whole stale image.");
         ImGui::BeginDisabled(!g_delta_reuse);
         changed |= ImGui::SliderFloat("Follow motion", &g_reproject, -1.0f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("Walks the motion vectors back to where each pixel was, so the "
-                              "effect lands on the moving geometry instead of trailing behind "
-                              "it. 0 reapplies it in place.");
+        ImGui::SetItemTooltip("Walks the motion vectors back to where each pixel was, so the effect lands "
+                              "on the moving geometry instead of trailing behind it. 0 reapplies it in place.");
         changed |= ImGui::SliderFloat("Disocclusion reject", &g_depth_reject, 0.0f, 0.2f, "%.4f");
-        ImGui::SetItemTooltip("Drops the stored effect where the depth no longer matches, which "
-                              "is what uncovered pixels look like. Lower rejects more.");
+        ImGui::SetItemTooltip("Drops the stored effect where the depth no longer matches, which is what "
+                              "uncovered pixels look like. Lower rejects more.");
         changed |= ImGui::SliderFloat("Structure gate", &g_struct_gate, 0.0f, 4.0f, "%.2f");
-        ImGui::SetItemTooltip("Holds the effect to what the local contrast can account for, "
-                              "removing silhouettes left behind by things that moved. Applies "
-                              "only where the depth test already found the history doubtful.");
+        ImGui::SetItemTooltip("Holds the effect to what the local contrast can account for, removing "
+                              "silhouettes left behind by things that moved.");
         changed |= ImGui::SliderFloat("Effect clamp", &g_delta_clamp, 0.0f, 1.0f, "%.2f");
         ImGui::SetItemTooltip("Caps the reused effect's magnitude. 0 removes the cap.");
         ImGui::EndDisabled();
         ImGui::BeginDisabled(g_delta_reuse);
         changed |= ImGui::Checkbox("Pass the game's colour instead", &g_skip_passthrough);
-        ImGui::SetItemTooltip("Fallback: drops the effect on skipped frames rather than "
-                              "reconstructing it.");
+        ImGui::SetItemTooltip("Fallback: drops the effect on skipped frames rather than reconstructing it.");
         ImGui::EndDisabled();
         ImGui::EndDisabled();
 
         ImGui::Spacing();
-        ImGui::SeparatorText("Network parameters");
-        ImGui::TextDisabled("What the preset above sets. 1.00 across the board is the "
-                            "reference; above that is where Overdrive and AI slop live, "
-                            "and it is reported to look worse -- on purpose.");
-        bool net = false;
-        changed |= ImGui::Checkbox("Automatic mask", &g_auto_mask);
-        ImGui::SetItemTooltip("Lets the network decide per pixel where to apply its result. "
-                              "Without it the final blend is uniform.");
-        net |= ImGui::SliderFloat("Intensity", &g_intensity, 0.0f, 2.0f, "%.2f");
-        net |= ImGui::SliderFloat("Local tone", &g_local_tone, 0.0f, 2.0f, "%.2f");
-        net |= ImGui::SliderFloat("Local structure", &g_local_structure, 0.0f, 2.0f, "%.2f");
-        net |= ImGui::SliderFloat("Skin structure", &g_skin_structure, -1.0f, 2.0f, "%.2f");
-        ImGui::SetItemTooltip("-1 follows Local structure.");
-        if (net) { g_preset = 0; changed = true; }
+        ImGui::SeparatorText("Diagnostics");
+        changed |= ImGui::Checkbox("Write diagnostics to ReShade.log", &g_diagnostics);
+        ImGui::SetItemTooltip("Heartbeat, per-frame state and profiler lines. Off keeps the log quiet; "
+                              "the cost readout above works either way.");
+        changed |= ImGui::Checkbox("Debug hotkeys", &g_debug_keys);
+        ImGui::SetItemTooltip("F6 cycles effect strength (normal / exaggerated / off), F8 stalls the "
+                              "present thread, F10 stamps the log, F11 shifts the cadence phase. Off by "
+                              "default so they cannot collide with the game's keys.");
         ImGui::Spacing();
     }
 
-    ImGui::Spacing();
-    ImGui::SeparatorText("Status");
-    if (g_ui_fps > 0.0f) {
-        ImGui::Text("%.2f ms   %.0f fps", g_ui_ms, g_ui_fps);
-        if (g_nr_enabled && g_ui_base_ms > 0.0f)
-            ImGui::Text("NR cost %.2f ms   network at %.0f Hz",
-                        g_ui_ms - g_ui_base_ms, g_ui_nr_hz);
-        else if (g_nr_enabled)
-            ImGui::TextDisabled("Toggle off once to measure the NR cost.");
-    } else {
-        ImGui::TextDisabled("Waiting for frames...");
-    }
-    if (g_nr_handle == nullptr)
-        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Network not created yet");
-
+    // ---- footer ----------------------------------------------------------------
     ImGui::Spacing();
     if (ImGui::Button("Reset to defaults")) {
-        g_nr_enabled = true; g_skip_n = 1; g_codec_on = true;
-        g_paper_white = 1.0f; g_knee = 0.75f;
+        g_nr_enabled = true; g_skip_n = 1; g_passes = 1; g_style = 1;
+        g_preset = 3; apply_preset(3); g_effect_strength = 1.0f; g_auto_mask = true;
+        g_codec_on = true; g_auto_pw = true; g_paper_white = 1.0f; g_knee = 0.75f;
+        g_transfer = 1.0f; g_color_strength = 1.0f; g_chroma_transfer = 0.0f; g_input_gain = 1.0f;
+        g_delta_reuse = true; g_reproject = 1.0f; g_depth_reject = 0.02f; g_struct_gate = 1.0f;
+        g_delta_clamp = 0.25f; g_skip_passthrough = true;
+        g_toggle_vk = VK_F7; g_debug_keys = false; g_net_scale = 1.0f;
         changed = true;
     }
     ImGui::SameLine();
     ImGui::TextDisabled("Saved per game in ReShade.ini");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextDisabled("Made with ADHD by ProjectSaturnStudios");
 
     if (changed) save_settings(rt);
 }
@@ -2409,10 +2877,11 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
             g_cx.exp_rb->Unmap(0, &w0);
             if (e > 1e-5f && e < 1e5f) {
                 // Exposure is the factor the game applies to reach display range,
-                // so the reference white in scene-linear terms is its reciprocal.
-                float pw = 1.0f / e;
+                // so the reference white in buffer terms is its reciprocal, scaled
+                // by whatever pre-exposure the game says it already applied.
+                float pw = g_pre_exposure / (e * g_exposure_scale);
                 if (pw < 0.05f) pw = 0.05f;
-                if (pw > 8.0f)  pw = 8.0f;
+                if (pw > 32.0f) pw = 32.0f;
                 g_pw_measured = pw;
                 if (g_auto_pw) {
                     g_paper_white = g_pw_valid ? (g_paper_white * 0.85f + pw * 0.15f) : pw;
@@ -2444,10 +2913,10 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
             // HDR, but not seeing them proves nothing -- a night scene in an HDR
             // buffer never exceeds 1.0 either. So latch on, never off, and start
             // assuming HDR so a dark scene cannot flip the codec mid-session.
-            const UINT64 over = bins[128];
-            if (over * 1000ull > total) g_hdr_detected = true;
+            // Whether this buffer is scene-linear is settled by its format, not
+            // here. This counter only paces how long the depth and shoulder
+            // guides keep sampling.
             ++g_hdr_samples;
-            if (!g_hdr_detected && g_hdr_samples < 400) g_hdr_detected = true;
             if (bins[130] > 0) {
                 const float d = (float)bins[129] / (1000.0f * (float)bins[130]);
                 g_depth_reversed = (d > 0.5f);
@@ -2476,9 +2945,11 @@ static void tick_exposure(ID3D12CommandQueue *queue) {
         // encode past 1.0 and drags the anti-clipping guard across the whole frame
         // -- measured as a heavy loss of saturation at night. Let a night scene
         // stay dark: only real highlights define white.
+        // The ceiling used to be 4.0, which Alan Wake 2 pins against every
+        // frame; a clamped measurement is a wrong measurement.
         float pw = p90;
         if (pw < 0.35f) pw = 0.35f;
-        if (pw > 4.0f)  pw = 4.0f;
+        if (pw > 32.0f) pw = 32.0f;
         // Fallback only: if the game handed us a real exposure recently, its
         // number wins and the histogram just keeps the guides up to date.
         if (!g_exp_from_game) {
@@ -2513,13 +2984,15 @@ static void release_state(const char *why) {
     if (g_nr_handle_hi) { g_nr_handle_hi = nullptr; }
 
     auto rls = [](auto *&p) { if (p) { p->Release(); p = nullptr; } };
-    rls(g_nr_out); rls(g_nr_out_hi);
+    rls(g_nr_out); rls(g_nr_out2); rls(g_nr_out_hi);
     rls(g_cx.proxy); rls(g_cx.final_tex); rls(g_cx.delta); rls(g_cx.hist); rls(g_cx.hist_rb);
     rls(g_cx.heap); rls(g_cx.clear_heap); rls(g_cx.pso_enc); rls(g_cx.pso_dec);
     rls(g_cx.pso_hist); rls(g_cx.pso_delta); rls(g_cx.pso_apply); rls(g_cx.pso_snap);
     rls(g_cx.pso_advect); rls(g_cx.delta2);
     rls(g_cx.snap_color); rls(g_cx.snap_depth); rls(g_cx.snap_mv);
     g_cx.snap_ready = false;
+    rls(g_cx.pso_down); rls(g_cx.pso_down_mv); rls(g_cx.lo_depth); rls(g_cx.lo_mv);
+    g_lo_w = g_lo_h = 0; g_lo_active = false;
     rls(g_cx.root); rls(g_cx.fence);
     g_cx.ready = false; g_cx.pending = false; g_cx.copy_recorded = false;
     g_cx.slot = 0; g_cx.fence_val = 0; g_cx.pending_at = 0;
@@ -2569,8 +3042,44 @@ static bool is_framegen_snippet(HMODULE m) {
     return false;
 }
 
+// Two add-ons cannot both detour the NGX entry points. Both lay trampolines over
+// the same bytes, both initialise the neural runtime, and both drive a feature of
+// their own on the game's command list while each saves and restores the compute
+// state the other is changing. Measured in Alan Wake 2: the process dies at the
+// second feature creation, a few seconds after the first frame. There is nothing
+// to negotiate here, so find out before hooking anything and stay out entirely.
+static bool conflicting_addon_loaded() {
+    static const wchar_t *mods[] = {
+        L"renodx-dlss5.addon64", L"renodx-dlss.addon64",
+        L"standalone-dlssnr.addon64", L"nvngx.dll.addon64",
+    };
+    static const char *names[] = {
+        "renodx-dlss5.addon64", "renodx-dlss.addon64",
+        "standalone-dlssnr.addon64", "nvngx.dll.addon64",
+    };
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&conflicting_addon_loaded), &self);
+    for (unsigned i = 0; i < 4; ++i) {
+        HMODULE m = GetModuleHandleW(mods[i]);
+        if (m != nullptr && m != self) { g_conflict_name = names[i]; return true; }
+    }
+    return false;
+}
+
 static void install_hook() {
     if (g_hooked) return;
+    if (conflicting_addon_loaded()) {
+        g_hooked = true;            // decided once; never reconsidered this session
+        g_conflict = true;
+        logf("[NRPRE] %s is loaded and detours the same NGX entry points. Two "
+             "add-ons cannot share them and the game crashes when both drive the "
+             "neural runtime, so this one is standing down: nothing is hooked and "
+             "the game runs untouched. Keep one of the two and restart.",
+             g_conflict_name);
+        return;
+    }
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -2641,7 +3150,9 @@ static void install_hook() {
 // and the network's temporal history has to be dropped across it.
 static void on_init_swapchain(reshade::api::swapchain *, bool resize) {
     if (!resize) return;
-    release_state("swapchain recreated");
+    // Queued rather than done here: a resize runs while the game still has
+    // frames in flight, and this add-on's textures are among what they read.
+    g_rebuild_pending = true;
     g_force_reset_frames = 8;       // flush the network's history afterwards
     g_diag_frames = 90;
 }
@@ -2669,12 +3180,39 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
                        uint32_t, const reshade::api::rect *)
 {
     static bool prev_down = false;
-    const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    const bool down = (GetAsyncKeyState(g_toggle_vk) & 0x8000) != 0;
     if (down && !prev_down) {
         g_nr_enabled = !g_nr_enabled;
-        logf("[NRPRE] F7: DLSS-NR %s", g_nr_enabled ? "ON" : "OFF");
+        g_settings_dirty = true;
+        logf("[NRPRE] F%d: DLSS-NR %s", g_toggle_vk - VK_F1 + 1, g_nr_enabled ? "ON" : "OFF");
     }
     prev_down = down;
+    if (g_settings_dirty && g_rt != nullptr) { g_settings_dirty = false; save_settings(g_rt); }
+
+    {   // One cost sample per network size, so the panel projects from
+        // measurements instead of assuming how the network scales.
+        static float last_ms = 0.0f;
+        if (g_ui_net_ms > 0.0f && g_ui_net_ms != last_ms) {
+            last_ms = g_ui_net_ms;
+            const unsigned gw = g_lo_active ? g_lo_w : g_net_w;
+            const unsigned gh = g_lo_active ? g_lo_h : g_net_h;
+            // Per pass, so changing the pass count does not corrupt the fit.
+            cost_record((double)gw * (double)gh,
+                        (double)g_ui_net_ms / (double)(g_passes > 0 ? g_passes : 1));
+        }
+    }
+
+    // The one place anything is torn down. Everything that notices a change --
+    // the evaluate hook, a swapchain resize, the network-resolution slider --
+    // only raises the flag; here the queue is drained first, so nothing is freed
+    // while the GPU is still reading it. The next evaluate rebuilds.
+    if (g_setup_done && g_nr_handle != nullptr && g_applied_scale != g_net_scale)
+        g_rebuild_pending = true;
+    if (g_rebuild_pending) {
+        g_rebuild_pending = false;
+        if (queue != nullptr) queue->wait_idle();
+        release_state("rebuilding for a new resolution");
+    }
 
     // F10 stamps the log so a visual event can be located exactly: the breakage
     // leaves no DXGI or state trace, so the timestamp has to come from the user.
@@ -2687,7 +3225,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     // wrong in an obvious way, the whole pipeline is alive; if it looks identical,
     // nothing is reaching the screen and the strength is not the problem.
     static bool ex_prev = false;
-    const bool ex_down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    const bool ex_down = g_debug_keys && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
     if (ex_down && !ex_prev) {
         g_effect_strength = (g_effect_strength > 2.0f)  ? 0.0f
                           : (g_effect_strength < 0.01f) ? 1.0f
@@ -2699,7 +3237,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     ex_prev = ex_down;
 
     static bool mark_prev = false;
-    const bool mark_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    const bool mark_down = g_debug_keys && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (mark_down && !mark_prev) {
         static unsigned mark_no = 0;
         logf("[NRPRE] ======== MARK #%u ======== pw=%.4f meas=%.4f valid=%d upd=%u "
@@ -2720,7 +3258,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     // artefact still comes. If it does, the artefact is a pacing failure and not
     // anything this add-on draws.
     static bool stall_prev = false;
-    const bool stall_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    const bool stall_down = g_debug_keys && (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (stall_down && !stall_prev) {
         LARGE_INTEGER f, t0, t1;
         QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
@@ -2735,7 +3273,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     stall_prev = stall_down;
 
     static bool ph_prev = false;
-    const bool ph_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    const bool ph_down = g_debug_keys && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (ph_down && !ph_prev) {
         g_phase = (g_phase + 1) % (unsigned)(g_skip_n > 0 ? g_skip_n : 1);
         logf("[NRPRE] F11: cadence phase -> %u/%d", g_phase, g_skip_n);
@@ -2785,6 +3323,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::register_overlay("NR Pre-Upscale", draw_overlay);
 #endif
         reshade::register_event<reshade::addon_event::init_effect_runtime>(load_settings);
+        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::register_event<reshade::addon_event::present>(on_present);
         logf("[NRPRE] addon registered (NR at render resolution -- configure in the ReShade overlay)");
         break;
@@ -2793,6 +3332,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(load_settings);
+        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::unregister_event<reshade::addon_event::present>(on_present);
         reshade::unregister_addon(hModule);
         break;

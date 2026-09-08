@@ -1,5 +1,8 @@
-# Third-party SDKs are fetched, not vendored -- see README.
+# Third-party SDKs are fetched, not vendored -- see README and scripts/fetch-deps.ps1
 external/
+
+# a portable toolchain dropped in beside the project
+tools/
 
 # build output
 *.addon64

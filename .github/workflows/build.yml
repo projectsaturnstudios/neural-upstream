@@ -1,0 +1,41 @@
+# Builds the add-on on every push and pull request so a change that no longer
+# compiles, or a shader that no longer compiles, is caught before it reaches a
+# game folder. Produces the .addon64 as a downloadable artifact.
+#
+# Written before the repository had a remote; it has not run on GitHub yet.
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A MinGW-w64 g++ with C++20. Chocolatey's package is the winlibs build,
+      # the same family the project is developed against.
+      - name: Install MinGW-w64
+        run: choco install mingw --no-progress -y
+        shell: pwsh
+
+      - name: Fetch third-party headers
+        run: .\scripts\fetch-deps.ps1
+        shell: pwsh
+
+      - name: Compile every compute kernel
+        run: .\check-shaders.ps1
+        shell: pwsh
+
+      - name: Build
+        run: .\build.ps1
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neural-upstream.addon64
+          path: neural-upstream.addon64
+          if-no-files-found: error

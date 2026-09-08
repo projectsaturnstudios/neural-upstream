@@ -1,0 +1,12 @@
+# Sources are LF, matching upstream, so diffs show changes and not line endings.
+*        text=auto eol=lf
+*.cpp    text eol=lf
+*.h      text eol=lf
+*.hlsl   text eol=lf
+*.md     text eol=lf
+*.ps1    text eol=lf
+*.sh     text eol=lf
+*.yml    text eol=lf
+*.addon64 binary
+*.dll    binary
+*.bin    binary
