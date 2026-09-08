@@ -343,7 +343,7 @@ static void guide_dispatch(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12Pi
 struct CodecK {
     UINT w, h; float pw, ts, cs; UINT hdr; float knee, dclamp;
     float mvx, mvy, reproj, dreject, sgate, strength, chroma, pad4;
-    UINT nw, nh, fw, fh;
+    UINT nw, nh, fw, fh, sw, sh;
 };
 static const unsigned kCodecConsts = sizeof(CodecK) / 4;
 static void advect_delta(ID3D12GraphicsCommandList *, ID3D12Device *, ID3D12Resource *,
@@ -424,6 +424,21 @@ static bool  g_hdr_detected = true;
 static unsigned g_hdr_samples = 0;
 // How many histogram reads before the depth and shoulder guides have settled.
 static const unsigned kGuideSamples = 400;
+// A typed view for writing into a game-owned texture. A typeless resource has to
+// be viewed as one of its typed forms; the wrong one is an invalid view, which
+// without the debug layer is undefined behaviour rather than an error.
+static DXGI_FORMAT uav_format_for(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   return DXGI_FORMAT_R8G8B8A8_UNORM;   // UAVs cannot be sRGB
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   return DXGI_FORMAT_B8G8R8A8_UNORM;
+    default: return f;
+    }
+}
 static bool format_is_float(DXGI_FORMAT f) {
     switch (f) {
     case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT:
@@ -459,6 +474,13 @@ static int   g_style = 1;               // 0 Natural, 1 Cinematic
 // with area; the delta is low frequency and survives the resample. 1.0 keeps
 // the original behaviour exactly.
 static float g_net_scale = 1.0f;
+// Where the network sits. 0: before the upscale, on the render-resolution colour
+// DLSS is about to consume (this add-on's reason to exist). 1: after it, on the
+// output-resolution frame DLSS produced, which is where RenoDX's add-on works.
+// The second costs what the output costs and exists so the two can be compared
+// in one panel with the same controls. Switching rebuilds the network.
+static int   g_placement = 0;
+static int   g_applied_placement = 0;
 static unsigned g_lo_w = 0, g_lo_h = 0;   // the network's grid, set at setup
 static bool  g_lo_active = false;          // the grid differs from the render one
 static float g_applied_scale = 1.0f;       // g_net_scale the current state was built for
@@ -677,6 +699,9 @@ struct Codec {
     // resolution: depth point-sampled, motion vectors shrunk to that grid.
     ID3D12PipelineState *pso_down = nullptr, *pso_down_mv = nullptr;
     ID3D12Resource *lo_depth = nullptr, *lo_mv = nullptr;
+    // After the upscale the frame is output-resolution but depth and motion are
+    // still render-resolution; these are them brought up to the output grid.
+    ID3D12Resource *full_depth = nullptr, *full_mv = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
     ID3D12Resource *proxy = nullptr, *final_tex = nullptr;
     ID3D12Resource *delta = nullptr;      // what the network added, reused on skipped frames
@@ -932,6 +957,10 @@ static bool codec_init(ID3D12Device *dev, unsigned w, unsigned h) {
     if (lo && g_cx.pso_down && g_cx.pso_down_mv) {
         g_cx.lo_depth = make_uav_tex(dev, lw, lh, DXGI_FORMAT_R32_FLOAT);
         g_cx.lo_mv    = make_uav_tex(dev, lw, lh, DXGI_FORMAT_R16G16_FLOAT);
+    }
+    if (g_placement == 1 && g_cx.pso_down && g_cx.pso_down_mv) {
+        g_cx.full_depth = make_uav_tex(dev, w, h, DXGI_FORMAT_R32_FLOAT);
+        g_cx.full_mv    = make_uav_tex(dev, w, h, DXGI_FORMAT_R16G16_FLOAT);
     }
     g_cx.ready = (g_cx.proxy && g_cx.final_tex && g_cx.delta);
     logf("[NRPRE] codec: ready=%d proxy=%p final=%p network grid=%ux%u of %ux%u",
@@ -1286,10 +1315,17 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                      cw, ch);
             rw = cw; rh = ch;
         }
+        // After the upscale the network's whole world is the output grid.
+        if (g_placement == 1 && g_out_w > 0 && g_out_h > 0) {
+            rw = g_out_w; rh = g_out_h; cw = g_out_w; ch = g_out_h;
+        }
         if (!g_setup_done)
             logf("[NRPRE] setup gate: rw=%u rh=%u cmd=%p", rw, rh, (void *)cmd);
         if (rw > 0 && rh > 0 && !g_setup_done) {
             g_applied_scale = g_net_scale;
+            g_applied_placement = g_placement;
+            if (g_placement == 1)
+                logf("[NRPRE] placement: after the upscale, network on the %ux%u output", rw, rh);
             if (g_net_scale < 0.995f) {
                 // Size the network's grid from the colour texture it will read,
                 // not from the sub-rectangle: those differ by a couple of padding
@@ -1310,7 +1346,14 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
         }
     }
-    // ---- 2c: run NR at render resolution on the DLSS input colour, discard result ----
+    // After-upscale bookkeeping. Once the game's DLSS has been called for this
+    // frame its result has to be the one returned, whatever else happens, and the
+    // output has to go back to the state DLSS left it in exactly once.
+    bool post_done = false, post_restored = false;
+    NVSDK_NGX_Result post_result = NVSDK_NGX_Result_Success;
+    ID3D12Resource *outc = nullptr;
+
+    // ---- 2c: run NR on the colour DLSS consumes (before) or produced (after) ----
     if (g_nr_enabled && g_nr_handle && g_nr_out && g_snip_eval && params) {
         ID3D12Resource *src = nullptr, *dep = nullptr, *mv = nullptr;
         if (g_ptr_slot >= 0) {
@@ -1321,10 +1364,16 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             param_get_slot(params, (unsigned)g_ptr_slot, NVSDK_NGX_Parameter_MotionVectors,
                            reinterpret_cast<void **>(&mv));
         }
+        // After the upscale the colour we work on is the DLSS output, not its input.
+        if (g_placement == 1 && g_ptr_slot >= 0)
+            param_get_slot(params, (unsigned)g_ptr_slot, NVSDK_NGX_Parameter_Output,
+                           reinterpret_cast<void **>(&outc));
+        const bool post = (g_placement == 1) && outc != nullptr;
+        ID3D12Resource *colour_src = post ? outc : src;
         unsigned w_net = 0, h_net = 0;
         {
             D3D12_RESOURCE_DESC sd{};
-            if (src && res_desc(src, &sd)) {
+            if (colour_src && res_desc(colour_src, &sd)) {
                 w_net = (unsigned)sd.Width; h_net = sd.Height;
                 // The colour format settles whether this buffer is scene-linear.
                 const bool hdr_capable = format_is_float(sd.Format);
@@ -1348,6 +1397,16 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         }
         if (g_rebuild_pending) return t_orig_eval(cmd, feat, params, cb);
 
+        if (post) {
+            // The game's own DLSS runs first; everything below works on what it
+            // wrote. DLSS leaves its output in UAV state, and the game expects to
+            // find it there, so it is borrowed as a shader input and given back.
+            post_result = t_orig_eval(cmd, feat, params, cb);
+            post_done = true;
+            barrier_transition(cmd, outc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+
         // The grid the network, proxy and delta live on. lw/lh is that grid;
         // w_net/h_net stays the game's render grid for everything full-size.
         const bool lo_active = g_lo_w != 0 && g_lo_h != 0 && (g_lo_w != w_net || g_lo_h != h_net);
@@ -1363,7 +1422,7 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         NVSDK_NGX_Parameter *pp  = hi ? g_nr_params_hi : g_nr_params;
         NVSDK_NGX_Handle    *hh  = hi ? g_nr_handle_hi : g_nr_handle;
         ID3D12Resource      *out = hi ? g_nr_out_hi    : g_nr_out;
-        ID3D12Resource      *in  = hi ? dst_col        : src;
+        ID3D12Resource      *in  = hi ? dst_col        : colour_src;
 
         if (in && dep && mv) {
             ID3D12Resource *net_color = in, *net_depth = dep, *net_mv = mv;
@@ -1516,12 +1575,37 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
             }
             const bool use_codec = g_codec_on && !hi && g_device != nullptr
                                    && codec_init(g_device, w_net, h_net);
-            // A smaller network grid only exists through the codec: without it the
-            // feature would be handed full-size textures it was not created for.
-            if (lo_active && !use_codec) return t_orig_eval(cmd, feat, params, cb);
-
             const D3D12_RESOURCE_STATES kUAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             const D3D12_RESOURCE_STATES kSRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            // A smaller network grid only exists through the codec: without it the
+            // feature would be handed full-size textures it was not created for.
+            // After the upscale the codec is not optional at all: the guides must
+            // be brought up to the output grid and the result written back.
+            const bool post_ready = post && use_codec && g_cx.full_depth && g_cx.full_mv
+                                 && g_cx.pso_down && g_cx.pso_down_mv && g_cx.pso_snap;
+            if ((lo_active && !use_codec) || (post && !post_ready)) {
+                if (post) {
+                    barrier_transition(cmd, outc, kSRV, kUAV); post_restored = true;
+                    return post_result;
+                }
+                return t_orig_eval(cmd, feat, params, cb);
+            }
+            if (post) {
+                // Depth and motion vectors are render-resolution; the frame is not.
+                // Bring both up to the output grid, motion in output pixels, and use
+                // those copies for everything that follows, the network included.
+                guide_dispatch(cmd, g_device, g_cx.pso_down,    dep, g_cx.full_depth,
+                               DXGI_FORMAT_R32_FLOAT, w_net, h_net);
+                guide_dispatch(cmd, g_device, g_cx.pso_down_mv, mv,  g_cx.full_mv,
+                               DXGI_FORMAT_R16G16_FLOAT, w_net, h_net);
+                uav_barrier(cmd, g_cx.full_depth);
+                uav_barrier(cmd, g_cx.full_mv);
+                barrier_transition(cmd, g_cx.full_depth, kUAV, kSRV);
+                barrier_transition(cmd, g_cx.full_mv,    kUAV, kSRV);
+                dep = g_cx.full_depth; mv = g_cx.full_mv;
+                pset_res(pp, "DLSSNR.Depth", dep);
+                pset_res(pp, "DLSSNR.MVec",  mv);
+            }
 
             // Every one of our textures starts and ends each frame in UAV state,
             // so the sequence below is self-contained and safe to toggle at will.
@@ -1705,6 +1789,40 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 feed = nullptr;                                   // let src go through untouched
                 ++g_pass_frames;   // the effect is fully off on this frame: count it
             }
+            if (post) {
+                // The game reads its DLSS output next, so the result goes over it in
+                // place. A typed store through our copy kernel, so the output's own
+                // format does not have to match ours. No feed means this frame keeps
+                // what DLSS wrote, which is the after-upscale form of passthrough.
+                if (feed != nullptr) {
+                    D3D12_RESOURCE_DESC od{};
+                    res_desc(outc, &od);
+                    barrier_transition(cmd, feed, kUAV, kSRV);
+                    barrier_transition(cmd, outc, kSRV, kUAV);
+                    guide_dispatch(cmd, g_device, g_cx.pso_snap, feed, outc,
+                                   uav_format_for(od.Format), w_net, h_net);
+                    uav_barrier(cmd, outc);
+                    barrier_transition(cmd, feed, kSRV, kUAV);
+                } else {
+                    barrier_transition(cmd, outc, kSRV, kUAV);
+                }
+                barrier_transition(cmd, g_cx.full_depth, kSRV, kUAV);
+                barrier_transition(cmd, g_cx.full_mv,    kSRV, kUAV);
+                post_restored = true;
+                ring_push(tick, feed, src, (unsigned)er, (unsigned)post_result, w_net, h_net,
+                          run_now, use_codec, g_final_valid, g_delta_valid, feed == nullptr);
+                if (er != NVSDK_NGX_Result_Success) {
+                    ++g_er_fail;
+                    if (g_er_fail <= 20 || (g_er_fail % 200) == 0)
+                        logf("[NRPRE] *** NR Evaluate(AFTER) FAILED -> 0x%08X  (#%u, tick %llu, net=%ux%u)",
+                             (unsigned)er, g_er_fail, (unsigned long long)tick, w_net, h_net);
+                } else if (g_eval_logged < 5) {
+                    logf("[NRPRE] 2c: NR Evaluate(AFTER) -> 0x%08X, written over the DLSS output",
+                         (unsigned)er);
+                    ++g_eval_logged;
+                }
+                return post_result;
+            }
             if (g_rebind && !hi && feed != nullptr) {
                 barrier_transition(cmd, feed, kUAV, kSRV);
                 pset_res(const_cast<NVSDK_NGX_Parameter *>(params),
@@ -1761,8 +1879,14 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                 ++g_eval_logged;
             }
         }
+        if (post_done && !post_restored) {
+            // Nothing was done to the output after all; hand it back as found.
+            barrier_transition(cmd, outc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            post_restored = true;
+        }
     }
-    return t_orig_eval(cmd, feat, params, cb);
+    return post_done ? post_result : t_orig_eval(cmd, feat, params, cb);
 }
 
 // A proxy forwards to the driver, so one game call can enter our hooks twice.
@@ -2174,7 +2298,7 @@ static void codec_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
             : (g_delta_age_scale ? g_reproject * (float)g_delta_age : g_reproject),
         g_depth_reject, g_struct_gate,
         g_effect_strength, g_chroma_transfer, (float)g_view,
-        nw, nh, fw, fh };
+        nw, nh, fw, fh, fw, fh };
 
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
@@ -2241,6 +2365,10 @@ static void guide_dispatch(ID3D12GraphicsCommandList *cmd, ID3D12Device *dev,
     CodecK k{}; k.w = w; k.h = h;
     k.nw = g_lo_active ? g_lo_w : fw; k.nh = g_lo_active ? g_lo_h : fh;
     k.fw = fw; k.fh = fh;
+    // The grid being read: a resample maps this dispatch's grid onto it by ratio,
+    // whichever of the two is larger.
+    k.sw = sd0.Width  ? (unsigned)sd0.Width : fw;
+    k.sh = sd0.Height ? sd0.Height          : fh;
     ID3D12DescriptorHeap *heaps[1] = { g_cx.heap };
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(g_cx.root);
@@ -2300,6 +2428,7 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "Cadence", v))       g_skip_n = (v < 1 ? 1 : (v > 3 ? 3 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "Passes", v))        g_passes = (v < 1 ? 1 : (v > 3 ? 3 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "Style", v))         g_style = (v == 1) ? 1 : 0;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "Placement", v))     g_placement = (v == 1) ? 1 : 0;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Codec", v))         g_codec_on = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoMask", v)) g_auto_mask = (v != 0);
     // ReShade re-creates the effect runtime several times per session; do not let
@@ -2360,6 +2489,7 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "Cadence", g_skip_n);
     reshade::set_config_value(rt, "NRPreUpscale", "Passes", g_passes);
     reshade::set_config_value(rt, "NRPreUpscale", "Style", g_style);
+    reshade::set_config_value(rt, "NRPreUpscale", "Placement", g_placement);
     reshade::set_config_value(rt, "NRPreUpscale", "NetScale", g_net_scale);
     reshade::set_config_value(rt, "NRPreUpscale", "AsyncNetwork", g_async_net ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "UniformDelta", g_uniform_delta ? 1 : 0);
@@ -2469,6 +2599,18 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                               "Pick one the game does not use.");
     }
 
+    {
+        const char *places[] = { "Before the upscale (render resolution)",
+                                 "After the upscale (output resolution)" };
+        int pl = (g_placement == 1) ? 1 : 0;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+        if (ImGui::Combo("Placement", &pl, places, 2)) { g_placement = pl; changed = true; }
+        ImGui::SetItemTooltip("Before: the network runs on the render-resolution colour DLSS is about "
+                              "to upscale, so its cost follows the game's render scale. After: it runs "
+                              "on the finished output frame, as RenoDX's add-on does, at output cost. "
+                              "Same controls either way; switching rebuilds the network.");
+    }
+
     // ---- cost ----------------------------------------------------------------
     ImGui::Spacing();
     ImGui::SeparatorText("Cost");
@@ -2499,13 +2641,18 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
                  * (double)(g_passes > 0 ? g_passes : 1);
         };
         ImGui::Spacing();
-        if (full) {
+        if (g_placement == 1) {
+            ImGui::TextDisabled("After the upscale the network works on the finished %ux%u frame, so the",
+                                g_out_w, g_out_h);
+            ImGui::TextDisabled("game's Resolution Scaling does not change its cost. Network resolution does.");
+        } else if (full) {
             ImGui::TextColored(kWarn, "The game is rendering at the full %ux%u, so the network sees", g_out_w, g_out_h);
             ImGui::TextColored(kWarn, "every output pixel. Lower Resolution Scaling in the game's menu,");
             ImGui::TextDisabled("or use the Network resolution slider below, which works regardless.");
         } else {
             ImGui::TextDisabled("Render %ux%u -> output %ux%u", g_net_w, g_net_h, g_out_w, g_out_h);
         }
+        if (g_placement == 0) {
         ImGui::TextDisabled("Cost at other values of the game's Resolution Scaling:");
         ImGui::TextDisabled("   100%%  (DLAA)           ~%.1f ms", est(1.0));
         ImGui::TextDisabled("    67%%  (Quality)        ~%.1f ms", est(0.6667));
@@ -2520,6 +2667,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
             else
                 ImGui::TextDisabled("Assumes cost scales with area, which understates the small sizes. "
                                     "Change the resolution once and these become measured.");
+        }
         }
     } else if (g_nr_enabled) {
         ImGui::TextDisabled("Network cost appears after a few seconds of gameplay.");
@@ -2773,7 +2921,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     // ---- footer ----------------------------------------------------------------
     ImGui::Spacing();
     if (ImGui::Button("Reset to defaults")) {
-        g_nr_enabled = true; g_skip_n = 1; g_passes = 1; g_style = 1;
+        g_nr_enabled = true; g_skip_n = 1; g_passes = 1; g_style = 1; g_placement = 0;
         g_preset = 3; apply_preset(3); g_effect_strength = 1.0f; g_auto_mask = true;
         g_codec_on = true; g_auto_pw = true; g_paper_white = 1.0f; g_knee = 0.75f;
         g_transfer = 1.0f; g_color_strength = 1.0f; g_chroma_transfer = 0.0f; g_input_gain = 1.0f;
@@ -2992,6 +3140,7 @@ static void release_state(const char *why) {
     rls(g_cx.snap_color); rls(g_cx.snap_depth); rls(g_cx.snap_mv);
     g_cx.snap_ready = false;
     rls(g_cx.pso_down); rls(g_cx.pso_down_mv); rls(g_cx.lo_depth); rls(g_cx.lo_mv);
+    rls(g_cx.full_depth); rls(g_cx.full_mv);
     g_lo_w = g_lo_h = 0; g_lo_active = false;
     rls(g_cx.root); rls(g_cx.fence);
     g_cx.ready = false; g_cx.pending = false; g_cx.copy_recorded = false;
@@ -3206,7 +3355,8 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     // the evaluate hook, a swapchain resize, the network-resolution slider --
     // only raises the flag; here the queue is drained first, so nothing is freed
     // while the GPU is still reading it. The next evaluate rebuilds.
-    if (g_setup_done && g_nr_handle != nullptr && g_applied_scale != g_net_scale)
+    if (g_setup_done && g_nr_handle != nullptr &&
+        (g_applied_scale != g_net_scale || g_applied_placement != g_placement))
         g_rebuild_pending = true;
     if (g_rebuild_pending) {
         g_rebuild_pending = false;

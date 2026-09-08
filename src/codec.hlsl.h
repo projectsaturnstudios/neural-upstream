@@ -39,6 +39,7 @@ cbuffer K : register(b0) {
   float  ViewMode;        // 0 result, 1 split, 2 network input, 3 network output
   uint2 NetSize;       // grid the network, proxy and delta live on
   uint2 FullSize;      // grid the game renders on
+  uint2 SrcSize;       // grid of the texture a guide resample reads from
 };
 
 float Luminance(float3 c) { return dot(c, float3(0.212639, 0.715169, 0.072192)); }
@@ -443,23 +444,24 @@ void CSSnapshot(uint3 tid : SV_DispatchThreadID) {
   Output[tid.xy] = Original.Load(int3(tid.xy, 0));
 }
 
-// The network's guide inputs on its own grid. Depth is point-sampled: a blend of
+// A guide resampled from the grid it was rendered on (SrcSize) to the grid this
+// dispatch covers (Size), in either direction. Depth is point-sampled: a blend of
 // two surfaces' depths is a depth that belongs to neither.
+float2 SrcCoord(uint2 px) { return (float2(px) + 0.5) * float2(SrcSize) / float2(Size) - 0.5; }
+
 [numthreads(16, 16, 1)]
 void CSDownsample(uint3 tid : SV_DispatchThreadID) {
   if (any(tid.xy >= Size)) return;
-  const int2 pf = NearestIn(LoToFull(float2(tid.xy)), FullSize);
-  Output[tid.xy] = Original.Load(int3(pf, 0));
+  Output[tid.xy] = Original.Load(int3(NearestIn(SrcCoord(tid.xy), SrcSize), 0));
 }
 
 // Motion vectors are in pixels of the grid they were rendered on, so a copy onto
-// a smaller grid has to shrink them by the same ratio.
+// another grid has to scale them by the same ratio, down or up.
 [numthreads(16, 16, 1)]
 void CSDownsampleMV(uint3 tid : SV_DispatchThreadID) {
   if (any(tid.xy >= Size)) return;
-  const int2 pf = NearestIn(LoToFull(float2(tid.xy)), FullSize);
-  float4 v = Original.Load(int3(pf, 0));
-  v.xy *= float2(NetSize) / float2(FullSize);
+  float4 v = Original.Load(int3(NearestIn(SrcCoord(tid.xy), SrcSize), 0));
+  v.xy *= float2(Size) / float2(SrcSize);
   Output[tid.xy] = v;
 }
 

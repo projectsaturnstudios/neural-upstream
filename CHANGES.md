@@ -59,6 +59,19 @@ of them. It is now a control. RenoDX's add-on labels the two **Natural** (0) and
 **Cinematic** (1) and defaults to Cinematic, which accounts for part of the
 difference between the two add-ons at matching slider values.
 
+**Placement.** A dropdown between running the network before the upscale, on
+the render-resolution colour DLSS is about to consume, and after it, on the
+output-resolution frame DLSS produced. The second is where RenoDX's add-on
+works; having both under the same controls is what makes the two approaches
+comparable. After-upscale mode lets the game's DLSS run first, brings depth and
+motion vectors up to the output grid with motion rescaled to output pixels, runs
+the same codec and network, and writes the result over the DLSS output through
+a typed store so the output's format need not match ours. Every exit path hands
+the output back in the state DLSS left it in. Cadence, passes, network
+resolution and the diagnostic views all work in both placements. Upstream had a
+stub for output-resolution evaluation as a cost benchmark; it ran on stale data
+and discarded the result.
+
 **Diagnostic views.** A View control hands the game the image the network was
 given, or the network's answer, or a split with the game's own frame on the
 left, instead of the result. This is how the colour reconstruction gets judged
