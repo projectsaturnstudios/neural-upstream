@@ -1,0 +1,16 @@
+# Third-party SDKs are fetched, not vendored -- see README.
+external/
+
+# build output
+*.addon64
+*.addon64.*
+*.exe
+*.o
+
+# working files
+*.bak*
+*.backup-*
+
+# proxy build output
+proxy/version.dll
+proxy/nvngx.dll.nr
