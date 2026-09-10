@@ -2109,8 +2109,17 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
     g_scratch_size = bytes;
     logf("[NRPRE] 2b: scratch(18) -> 0x%08X size=%llu", (unsigned)r, (unsigned long long)bytes);
     if (r != NVSDK_NGX_Result_Success) {
-        logf("[NRPRE] 2b: setup abandoned, scratch failed 0x%08X", (unsigned)r);
-        g_setup_done = true; return;
+        // Not fatal, and treating it as fatal was a bug. This query exists to
+        // tell the CORE route how much scratch to allocate. The core route has
+        // never once created feature 18 in any game observed: it always ends at
+        // 0xBAD0000B and the snippet route below is what actually works. The
+        // size returned here is zero even on success and is never read. So this
+        // abandoned setup on behalf of a path that does not work, using a number
+        // nothing consumes, and the add-on then sat with a null handle forever.
+        // Stellar Blade answers 0xBAD0000C (out of date) where other games
+        // answer success; carry on and let the snippet decide.
+        logf("[NRPRE] 2b: scratch query unavailable (0x%08X); the core route needs it and the "
+             "snippet route does not, so continuing", (unsigned)r);
     }
 
     if (cmd == nullptr) { logf("[NRPRE] 2b: setup deferred, no command list"); return; }
@@ -2600,10 +2609,11 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     }
 
     {
-        const char *places[] = { "Before the upscale (render resolution)",
-                                 "After the upscale (output resolution)" };
+        // Short previews: ImGui puts the label to the right of the widget, so a
+        // long one pushes the label off a narrow docked panel and clips itself.
+        const char *places[] = { "Before upscale", "After upscale" };
         int pl = (g_placement == 1) ? 1 : 0;
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
         if (ImGui::Combo("Placement", &pl, places, 2)) { g_placement = pl; changed = true; }
         ImGui::SetItemTooltip("Before: the network runs on the render-resolution colour DLSS is about "
                               "to upscale, so its cost follows the game's render scale. After: it runs "
@@ -2730,6 +2740,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     ImGui::Spacing();
     ImGui::SeparatorText("Look");
     const char *presets[] = { "Custom", "Light", "Moderate", "Reference", "Overdrive", "AI slop" };
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
     if (ImGui::Combo("Preset", &g_preset, presets, 6)) { apply_preset(g_preset); changed = true; }
     ImGui::SetItemTooltip("How far the network is allowed to reinterpret the image. Reference is what it "
                           "produces on its own; the lower settings pull back its micro-detail first, "
@@ -2778,9 +2789,9 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     }
 
     {
-        const char *views[] = { "Result", "Split: game left, result right",
-                                "What the network was given", "What the network returned" };
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
+        const char *views[] = { "Result", "Split (game on the left)",
+                                "Network input", "Network output" };
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 12.0f);
         ImGui::Combo("View", &g_view, views, 4);
         ImGui::SetItemTooltip("Diagnostic. Hands the game something other than the result so the "
                               "colour reconstruction can be judged by eye. Not saved; resets to "
@@ -3324,7 +3335,29 @@ static void on_destroy_device(reshade::api::device *dev) {
 }
 
 static void on_init_device(reshade::api::device *dev) {
-    if (dev->get_api() != reshade::api::device_api::d3d12) return;
+    if (dev->get_api() != reshade::api::device_api::d3d12) {
+        // Said once. A support log that simply stops after "addon registered" is
+        // the most common thing to be handed, and this is the most common reason
+        // for it: the add-on hooks a Direct3D 12 entry point and has nothing to
+        // do anywhere else.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            const char *api = "an unrecognised API";
+            switch (dev->get_api()) {
+            case reshade::api::device_api::d3d9:   api = "Direct3D 9";  break;
+            case reshade::api::device_api::d3d10:  api = "Direct3D 10"; break;
+            case reshade::api::device_api::d3d11:  api = "Direct3D 11"; break;
+            case reshade::api::device_api::opengl: api = "OpenGL";      break;
+            case reshade::api::device_api::vulkan: api = "Vulkan";      break;
+            default: break;
+            }
+            logf("[NRPRE] this process is rendering with %s. This add-on hooks Direct3D 12 "
+                 "only and will do nothing here. If the game has a DirectX 12 mode, start it "
+                 "in that; otherwise the title is not supported.", api);
+        }
+        return;
+    }
     auto *d = reinterpret_cast<ID3D12Device *>(dev->get_native());
     if (g_device != nullptr && d != g_device) release_state("new device");
     if (g_device != d) {
@@ -3346,6 +3379,25 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     }
     prev_down = down;
     if (g_settings_dirty && g_rt != nullptr) { g_settings_dirty = false; save_settings(g_rt); }
+
+    {   // Say the two things that are actually wrong most often, once, after long
+        // enough that neither can be a slow start. Without this the log for a
+        // game that never calls DLSS looks identical to one where the add-on
+        // broke, and only one of those is worth debugging.
+        static unsigned frames = 0;
+        static bool said = false;
+        if (!said && ++frames == 1200) {
+            said = true;
+            if (g_logged == 0)
+                logf("[NRPRE] 1200 frames and the game has not called DLSS once. Turn DLSS on "
+                     "in the game's own graphics settings; with it off there is nothing for "
+                     "this add-on to attach to.");
+            else if (g_nr_handle == nullptr)
+                logf("[NRPRE] the game is calling DLSS, but the neural feature was never "
+                     "created. Check that nvngx_dlssnr.dll sits in the game folder and that "
+                     "this file's name still contains 'nvngx.dll'.");
+        }
+    }
 
     {   // One cost sample per network size, so the panel projects from
         // measurements instead of assuming how the network scales.
