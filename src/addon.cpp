@@ -497,6 +497,7 @@ static const char *g_poke_why = "poke";
 static volatile LONG g_hooks_frozen = 0;
 static volatile LONG g_eval_inflight = 0;
 static volatile LONG g_arm_evals = 0;
+static volatile LONG g_arm_dlss_evals = 0;
 static unsigned g_eval_hook_count = 0;
 
 static const char *hook_method_name(int m) {
@@ -1332,6 +1333,9 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
         reinterpret_cast<PFN_GFf>(fvt[14])(params, NVSDK_NGX_Parameter_Jitter_Offset_Y, &fjy);
         if (fjx == 0.0f && fjy == 0.0f)
             return t_orig_eval(cmd, feat, params, cb);
+        InterlockedIncrement(&g_arm_dlss_evals);
+    } else {
+        InterlockedIncrement(&g_arm_dlss_evals);
     }
     if (params != nullptr && (g_logged < 12 || !g_setup_done)) {
         if (g_logged == 0) probe_slots(params, NVSDK_NGX_Parameter_Color);
@@ -1965,21 +1969,27 @@ static NVSDK_NGX_Result eval_dispatch(unsigned idx, ID3D12GraphicsCommandList *c
     PFN_Eval orig = g_orig_eval_n[idx];
     if (orig == nullptr) return NVSDK_NGX_Result_Fail;
     if (t_depth > 0) return orig(cmd, feat, params, cb);   // nested: just forward
-    if (g_hooks_frozen || g_hook_method == kHookOff)
-        return orig(cmd, feat, params, cb);
 
+    // Count every outermost trampoline, including frozen/Off passthrough,
+    // so apply_poke cannot Disable/Remove while a thread is still inside.
     InterlockedIncrement(&g_eval_inflight);
-    InterlockedIncrement(&g_arm_evals);
-
+    ++t_depth;
     PFN_Eval saved = t_orig_eval;
     const bool saved_fg = t_fg_guard;
     t_orig_eval = orig;
     t_fg_guard = (idx < kMaxNgx) && g_eval_fg_slot[idx];
-    ++t_depth;
-    NVSDK_NGX_Result r = eval_body(cmd, feat, params, cb);
-    --t_depth;
+
+    NVSDK_NGX_Result r;
+    if (g_hooks_frozen || g_hook_method == kHookOff) {
+        r = orig(cmd, feat, params, cb);
+    } else {
+        InterlockedIncrement(&g_arm_evals);
+        r = eval_body(cmd, feat, params, cb);
+    }
+
     t_orig_eval = saved;
     t_fg_guard = saved_fg;
+    --t_depth;
     InterlockedDecrement(&g_eval_inflight);
     return r;
 }
@@ -2680,7 +2690,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         ImGui::TextColored(kOff, "OFF");
     } else if (g_eval_hook_count == 0) {
         ImGui::TextColored(kWarn, "ON (looking for NGX / DLSS modules...)");
-    } else if (g_arm_evals == 0) {
+    } else if (g_arm_dlss_evals == 0) {
         ImGui::TextColored(kWarn, "ON (waiting for the game to call DLSS — menus often don't; try in-world or change Hook method / Poke)");
     } else if (g_nr_handle == nullptr) {
         ImGui::TextColored(kWarn, "ON (DLSS seen; neural feature not created — Poke to retry)");
@@ -3053,6 +3063,7 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     if (ImGui::Button("Reset to defaults")) {
         g_nr_enabled = true; g_skip_n = 1; g_passes = 1; g_style = 1; g_placement = 0;
         g_hook_method = kHookAuto;
+        request_poke("defaults");
         g_preset = 3; apply_preset(3); g_effect_strength = 1.0f; g_auto_mask = true;
         g_codec_on = true; g_auto_pw = true; g_paper_white = 1.0f; g_knee = 0.75f;
         g_transfer = 1.0f; g_color_strength = 1.0f; g_chroma_transfer = 0.0f; g_input_gain = 1.0f;
@@ -3423,8 +3434,12 @@ static bool attach_eval_target(LPVOID target, HMODULE mod, bool fg_extra) {
     if (slot < 0) return false;
     MH_STATUS cr = MH_CreateHook(target, const_cast<LPVOID>(kEvalThunks[slot]),
                                  reinterpret_cast<LPVOID *>(&g_orig_eval_n[slot]));
-    if (cr != MH_OK && cr != MH_ERROR_ALREADY_CREATED) return false;
-    if (cr == MH_ERROR_ALREADY_CREATED) return false;
+    if (cr == MH_ERROR_ALREADY_CREATED) {
+        MH_RemoveHook(target);
+        cr = MH_CreateHook(target, const_cast<LPVOID>(kEvalThunks[slot]),
+                           reinterpret_cast<LPVOID *>(&g_orig_eval_n[slot]));
+    }
+    if (cr != MH_OK) return false;
     const bool on = MH_EnableHook(target) == MH_OK;
     wchar_t path[MAX_PATH] = {};
     GetModuleFileNameW(mod, path, MAX_PATH);
@@ -3582,7 +3597,7 @@ static void tick_hooks() {
         if (!g_hooked) install_hook();
         return;
     }
-    if (g_eval_hook_count > 0 && g_arm_evals > 0) return;
+    if (g_eval_hook_count > 0 && g_arm_dlss_evals > 0) return;
     if (!g_hooked) {
         install_hook();
         return;
@@ -3631,14 +3646,15 @@ static void apply_poke(reshade::api::command_queue *queue) {
     g_setup_done = false;
     g_force_reset_frames = 8;
     InterlockedExchange(&g_arm_evals, 0);
+    InterlockedExchange(&g_arm_dlss_evals, 0);
     clear_seen_modules();
     g_present_scans = 0;
     g_hook_fail_logs = 0;
 
     if (g_conflict || conflicting_addon_loaded()) {
         g_conflict = true;
+        disarm_hooks();
         g_hooked = true;
-        g_eval_hook_count = 0;
         logf("[NRPRE] poke: method=%s evals=%u hooked=0 conflict=1 why=%s",
              hook_method_name(g_hook_method), prev_evals, why);
         g_poke_pending = false;
@@ -3739,7 +3755,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         static bool said = false;
         if (!said && ++frames == 1200) {
             said = true;
-            if (g_arm_evals == 0)
+            if (g_arm_dlss_evals == 0)
                 logf("[NRPRE] 1200 frames and the game has not called DLSS once. Turn DLSS on "
                      "in the game's own graphics settings, try in-world, or change Hook method / Poke; "
                      "with DLSS off there is nothing for this add-on to attach to. hooked=%u method=%s",
@@ -3748,7 +3764,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
                 logf("[NRPRE] the game is calling DLSS, but the neural feature was never "
                      "created. Check that nvngx_dlssnr.dll sits in the game folder and that "
                      "this file's name still contains 'nvngx.dll'. Poke retries create. evals=%u hooked=%u",
-                     (unsigned)g_arm_evals, g_eval_hook_count);
+                     (unsigned)g_arm_dlss_evals, g_eval_hook_count);
         }
     }
 
