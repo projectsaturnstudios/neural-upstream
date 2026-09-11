@@ -3306,6 +3306,7 @@ static const unsigned kMaxSeenMods = 512;
 static HMODULE g_seen_mods[kMaxSeenMods] = {};
 static unsigned g_seen_n = 0;
 static unsigned g_present_scans = 0;
+static unsigned g_hook_fail_logs = 0;
 
 static void path_lower(HMODULE m, wchar_t *out, size_t n) {
     if (m == nullptr || GetModuleFileNameW(m, out, (DWORD)n) == 0) { out[0] = 0; return; }
@@ -3427,8 +3428,11 @@ static bool attach_eval_target(LPVOID target, HMODULE mod, bool fg_extra) {
     const bool on = MH_EnableHook(target) == MH_OK;
     wchar_t path[MAX_PATH] = {};
     GetModuleFileNameW(mod, path, MAX_PATH);
-    logf("[NRPRE] hook %u on NVSDK_NGX_D3D12_EvaluateFeature: %s  %S%s",
-         (unsigned)slot, on ? "OK" : "FAILED", path, fg_extra ? "  [FrameGen extra]" : "");
+    if (on || g_hook_fail_logs < 4) {
+        logf("[NRPRE] hook %u on NVSDK_NGX_D3D12_EvaluateFeature: %s  %S%s",
+             (unsigned)slot, on ? "OK" : "FAILED", path, fg_extra ? "  [FrameGen extra]" : "");
+        if (!on) ++g_hook_fail_logs;
+    }
     if (!on) {
         MH_RemoveHook(target);
         g_orig_eval_n[slot] = nullptr;
@@ -3562,7 +3566,10 @@ static void install_hook() {
                            is_framegen_snippet(cands[i]));
     }
     if (g_eval_hook_count == 0) {
-        logf("[NRPRE] no NGX evaluate could be hooked");
+        if (g_hook_fail_logs < 4) {
+            logf("[NRPRE] no NGX evaluate could be hooked");
+            ++g_hook_fail_logs;
+        }
         return;
     }
     g_hooked = true;
@@ -3626,6 +3633,7 @@ static void apply_poke(reshade::api::command_queue *queue) {
     InterlockedExchange(&g_arm_evals, 0);
     clear_seen_modules();
     g_present_scans = 0;
+    g_hook_fail_logs = 0;
 
     if (g_conflict || conflicting_addon_loaded()) {
         g_conflict = true;
