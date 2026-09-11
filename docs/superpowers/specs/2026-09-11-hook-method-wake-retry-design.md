@@ -96,10 +96,12 @@ Track an **owned target registry**: each successfully `MH_CreateHook` + `MH_Enab
 
 Do **not** use `g_eval_count` for Waiting vs “DLSS seen”. That counter is cumulative and only increments after the neural path with a valid handle.
 
-- Increment `g_arm_evals` at the hooked EvaluateFeature thunk entry for the **outermost** interception (`t_depth == 0`). Nested proxy re-entry does not increment.
+- Increment `g_arm_evals` at the hooked EvaluateFeature thunk entry for the **outermost** non-frozen interception (`t_depth == 0`). Nested proxy re-entry does not increment.
+- Every outermost trampoline (including frozen/Off passthrough) increments `g_eval_inflight` so Disable/Remove cannot run while a thread is inside the detour.
 - Failed neural-handle creation still counts: the game called Evaluate.
-- Reset / advance the baseline to 0 when a Hook method change or Poke re-arm **completes**.
-- Status and poke `evals=<n>` use this current-arm value. Log the **pre-reset** arm count on poke so two consecutive pokes show the 0 → N transition.
+- FrameGen-extra **zero-jitter** evaluates increment `g_arm_evals` (thunk activity) but not `g_arm_dlss_evals`. Overlay Waiting vs “DLSS seen” uses `g_arm_dlss_evals` so FG cadence traffic does not look like a failed create.
+- Reset / advance both baselines to 0 when a Hook method change or Poke re-arm **completes**.
+- Poke `evals=<n>` logs the **pre-reset** `g_arm_evals` count so two consecutive pokes show the 0 → N transition.
 
 ### Idempotent quiescent re-arm
 
