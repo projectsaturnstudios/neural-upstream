@@ -82,6 +82,19 @@ Everything is in the ReShade overlay, under **NR Pre-Upscale**. Settings are
 saved per game in `ReShade.ini` under `[NRPreUpscale]`.
 
 - **Neural Rendering** with a configurable toggle key, F7 by default.
+- **Placement** (Before / After upscale): where the network sits relative to the
+  game's DLSS evaluate. Changing Placement rebuilds the network; it does not
+  re-arm NGX hooks.
+- **Hook method** and **Poke**: Off / Auto / Upscaled / FrameGen / Present
+  (RenoDX-aligned attach path). Auto is the v1.0.1 module scan and keeps your
+  Placement. Upscaled is that scan plus Placement After. If status stays on
+  waiting after boot, try Upscaled / FrameGen / Present or press Poke. Some
+  Streamline games only start DLSS evaluates after a path change. Menus often
+  never call DLSS — enter gameplay first (title-dependent). FrameGen does not
+  hook bare `nvngx_dlssg.dll` (that wrecks frame-generation cadence); it only
+  adds Streamline-family `*dlssg*` exporters, and zero-jitter FG calls are
+  ignored. Present periodically looks for late-loaded modules; it does not
+  invent DLSS.
 - **Cost** reports measured network time and projects what other render scales
   would cost on this machine.
 - **How often the network runs**, from every frame down to every third. Skipped
