@@ -3,6 +3,50 @@
 Everything below is on top of [matiasLombo/neural-upstream](https://github.com/matiasLombo/neural-upstream).
 Upstream's own research notes are in [FINDINGS.md](FINDINGS.md) and still apply.
 
+## v1.0.2
+
+**Hook method + Poke.** Two separate controls, aligned with RenoDX's Hook method
+without collapsing Placement into it.
+
+- **Placement** (unchanged): Before vs After the game's DLSS evaluate. Changing
+  it rebuilds the network and does **not** re-arm NGX hooks.
+- **Hook method** (`Off` / `Auto` / `Upscaled` / `FrameGen` / `Present`): where
+  to attach Evaluate hooks. Changing it, or pressing **Poke**, re-arms hooks on
+  the next present after in-flight evaluates drain, clears the neural create
+  latch, and force-resets temporal history. Config: `[NRPreUpscale] HookMethod`
+  = 0 Off, 1 Auto (default), 2 Upscaled, 3 FrameGen, 4 Present. Upscaled forces
+  Placement After and writes `Placement` in sync.
+
+Status no longer uses a single “waiting for the game to create DLSS” string.
+Order: conflict (standing down) → Hook method Off → looking for NGX/DLSS
+modules → waiting for the game to call DLSS (menus often don't) → DLSS seen
+but neural feature not created → green ON.
+
+Poke is always available while Neural Rendering is enabled. The log line is
+`[NRPRE] poke: method=<name> evals=<n> hooked=<count> conflict=<0|1> why=...`
+`evals` is the current-arm Evaluate count (thunk entry, reset on each re-arm),
+not the old cumulative neural-success counter. `hooked` is successfully enabled
+Evaluate hooks only; a failed scan stays retryable.
+
+**FrameGen** does **not** attach every `*dlssg*` exporter. Auto still skips
+`dlssg` in the path (hooking FG evaluate into the NR thunk steals the jitter
+claim and wrecks cadence). FrameGen additionally adopts Streamline-family
+`*dlssg*` modules (`streamline` in the path, or `sl.dlss*` / `sl.interposer`).
+Bare driver `nvngx_dlssg.dll` is never attached. Extra slots ignore zero-jitter
+evaluates so they cannot claim a frame. Prefer correctness: if a title only
+evaluates on a rejected FG path, use Present / Poke or wait for Feeder (not in
+this release).
+
+**Present** is late module adoption, not “run NR at Present.” While the current
+arm has seen no Evaluate, it scans for **new** exporters every 60 presents and
+stops once hooked and an evaluate has arrived (or you leave Present).
+
+Failed `Init_Ext` can be retried with Poke; a snippet that already initialised
+is not re-Inited (that hang is unchanged).
+
+Release asset must be renamed to `nvngx.dll.nrpre.addon64` (filename contains
+`nvngx.dll`). This tag is cut by Angel; this document is the changelog.
+
 ## Fixes
 
 **Tearing down GPU state from inside the evaluate hook crashed the game.**

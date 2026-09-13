@@ -119,6 +119,7 @@ static unsigned feat_id(const NVSDK_NGX_Handle *h) {
 }
 
 static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd);   // defined below
+static void request_poke(const char *why);
 static bool g_nr_enabled = true;    // starts in the optimal mode; F7 toggles
 static unsigned g_net_w, g_net_h;
 static int g_force_reset_frames = 0;
@@ -480,6 +481,42 @@ static float g_net_scale = 1.0f;
 // The second costs what the output costs and exists so the two can be compared
 // in one panel with the same controls. Switching rebuilds the network.
 static int   g_placement = 0;
+// RenoDX-aligned attach/re-bind path. Orthogonal to Placement: changing
+// Placement never re-arms NGX hooks. Upscaled is the one method that also
+// writes Placement (forces After). There is no "Before upscale" method value.
+enum HookMethod : int {
+    kHookOff = 0,
+    kHookAuto = 1,
+    kHookUpscaled = 2,
+    kHookFrameGen = 3,
+    kHookPresent = 4,
+};
+static int g_hook_method = kHookAuto;
+static bool g_poke_pending = false;
+static const char *g_poke_why = "poke";
+static volatile LONG g_hooks_frozen = 0;
+static volatile LONG g_eval_inflight = 0;
+static volatile LONG g_arm_evals = 0;
+static volatile LONG g_arm_dlss_evals = 0;
+static unsigned g_eval_hook_count = 0;
+
+static const char *hook_method_name(int m) {
+    switch (m) {
+    case kHookOff:      return "Off";
+    case kHookAuto:     return "Auto";
+    case kHookUpscaled: return "Upscaled";
+    case kHookFrameGen: return "FrameGen";
+    case kHookPresent:  return "Present";
+    default:            return "?";
+    }
+}
+
+static void request_poke(const char *why) {
+    g_poke_why = why ? why : "poke";
+    g_poke_pending = true;
+    InterlockedExchange(&g_hooks_frozen, 1);
+}
+
 static int   g_applied_placement = 0;
 static unsigned g_lo_w = 0, g_lo_h = 0;   // the network's grid, set at setup
 static bool  g_lo_active = false;          // the grid differs from the render one
@@ -975,6 +1012,18 @@ typedef NVSDK_NGX_Result (NVSDK_CONV *PFN_Eval)(ID3D12GraphicsCommandList *,
 static NVSDK_NGX_Parameter *g_nr_params = nullptr;
 
 static NVSDK_NGX_Handle *g_nr_handle = nullptr;
+// Snippet Init_Ext is process-lifetime after a success (re-Init hangs). Reset
+// only when abandoning a failed arm so Poke can retry Init_Ext.
+static bool g_snip_init_done = false;
+static bool g_snip_init_ok = false;
+static NVSDK_NGX_Result g_snip_init_res = NVSDK_NGX_Result_Fail;
+static void reset_failed_snip_init() {
+    if (g_nr_handle != nullptr) return;
+    if (!g_snip_init_ok) {
+        g_snip_init_done = false;
+        g_snip_init_res = NVSDK_NGX_Result_Fail;
+    }
+}
 static ID3D12Resource   *g_nr_out = nullptr;      // NR result at render resolution
 // Second feature at OUTPUT resolution, so we can A/B our own implementation
 // against itself: identical code path, only the network size differs.
@@ -1230,7 +1279,10 @@ static void ring_dump(const char *why)
 // through, so the body always continues down the right chain.
 static const unsigned kMaxNgx = 8;
 static PFN_Eval g_orig_eval_n[kMaxNgx] = {};
+static LPVOID g_eval_targets[kMaxNgx] = {};
+static bool g_eval_fg_slot[kMaxNgx] = {};
 static thread_local PFN_Eval t_orig_eval = nullptr;
+static thread_local bool t_fg_guard = false;
 static PFN_Eval g_orig_eval = nullptr;          // kept for the single-hook paths
 static unsigned g_logged = 0;
 
@@ -1269,6 +1321,21 @@ static NVSDK_NGX_Result NVSDK_CONV eval_body(ID3D12GraphicsCommandList *cmd,
                  g_net_w, g_net_h, (int)g_final_valid,
                  g_skip_n, (int)g_async_net,   // which mode was actually running, always
                  g_er_fail, g_gr_fail, g_pass_frames);
+    }
+    // FrameGen-extra slots: a zero-jitter FG evaluate must not steal the
+    // cadence claim (key 0 is remapped to 1 inside claim_frame) and must not
+    // run NR. Counted as an arm eval already, at thunk entry.
+    if (t_fg_guard && params != nullptr) {
+        float fjx = 0.0f, fjy = 0.0f;
+        auto **fvt = *reinterpret_cast<void ***>(const_cast<NVSDK_NGX_Parameter *>(params));
+        typedef NVSDK_NGX_Result (STDMETHODCALLTYPE *PFN_GFf)(const NVSDK_NGX_Parameter *, const char *, float *);
+        reinterpret_cast<PFN_GFf>(fvt[14])(params, NVSDK_NGX_Parameter_Jitter_Offset_X, &fjx);
+        reinterpret_cast<PFN_GFf>(fvt[14])(params, NVSDK_NGX_Parameter_Jitter_Offset_Y, &fjy);
+        if (fjx == 0.0f && fjy == 0.0f)
+            return t_orig_eval(cmd, feat, params, cb);
+        InterlockedIncrement(&g_arm_dlss_evals);
+    } else {
+        InterlockedIncrement(&g_arm_dlss_evals);
     }
     if (params != nullptr && (g_logged < 12 || !g_setup_done)) {
         if (g_logged == 0) probe_slots(params, NVSDK_NGX_Parameter_Color);
@@ -1903,12 +1970,27 @@ static NVSDK_NGX_Result eval_dispatch(unsigned idx, ID3D12GraphicsCommandList *c
     if (orig == nullptr) return NVSDK_NGX_Result_Fail;
     if (t_depth > 0) return orig(cmd, feat, params, cb);   // nested: just forward
 
-    PFN_Eval saved = t_orig_eval;
-    t_orig_eval = orig;
+    // Count every outermost trampoline, including frozen/Off passthrough,
+    // so apply_poke cannot Disable/Remove while a thread is still inside.
+    InterlockedIncrement(&g_eval_inflight);
     ++t_depth;
-    NVSDK_NGX_Result r = eval_body(cmd, feat, params, cb);
-    --t_depth;
+    PFN_Eval saved = t_orig_eval;
+    const bool saved_fg = t_fg_guard;
+    t_orig_eval = orig;
+    t_fg_guard = (idx < kMaxNgx) && g_eval_fg_slot[idx];
+
+    NVSDK_NGX_Result r;
+    if (g_hooks_frozen || g_hook_method == kHookOff) {
+        r = orig(cmd, feat, params, cb);
+    } else {
+        InterlockedIncrement(&g_arm_evals);
+        r = eval_body(cmd, feat, params, cb);
+    }
+
     t_orig_eval = saved;
+    t_fg_guard = saved_fg;
+    --t_depth;
+    InterlockedDecrement(&g_eval_inflight);
     return r;
 }
 
@@ -2155,20 +2237,19 @@ static void setup_nr(unsigned w, unsigned h, ID3D12GraphicsCommandList *cmd) {
         if (snip != nullptr) {
             auto si = reinterpret_cast<PFN_SnipInitExt>(SNIP_ENTRY(snip, "NVSDK_NGX_D3D12_Init_Ext", "nr_init"));
             auto sc = reinterpret_cast<PFN_Create>(SNIP_ENTRY(snip, "NVSDK_NGX_D3D12_CreateFeature", "nr_create"));
-            // Initialise the snippet at most once per process. The retry loop above
-            // exists because the runtime comes up lazily, but re-initialising one that
-            // is already up is a different thing entirely -- it hung the game to a
-            // black screen the first time this ran standalone.
-            static bool s_init_done = false;
-            static NVSDK_NGX_Result s_init_res = NVSDK_NGX_Result_Fail;
+            // Initialise the snippet at most once after a success. The retry
+            // loop exists because the runtime comes up lazily, but re-Init of
+            // one that is already up hung the game to a black screen. Failed
+            // arms reset this state from Poke (reset_failed_snip_init).
             if (si && sc) {
                 wchar_t lp[MAX_PATH] = L"";
                 GetEnvironmentVariableW(L"LOCALAPPDATA", lp, MAX_PATH);
-                NVSDK_NGX_Result ri = s_init_res;
-                if (!s_init_done) {
-                    s_init_done = true;
-                    ri = s_init_res = si(kNgxAppId, lp[0] ? lp : L".", g_device,
+                NVSDK_NGX_Result ri = g_snip_init_res;
+                if (!g_snip_init_done) {
+                    g_snip_init_done = true;
+                    ri = g_snip_init_res = si(kNgxAppId, lp[0] ? lp : L".", g_device,
                                          (NVSDK_NGX_Version)0x15, nullptr);
+                    g_snip_init_ok = (ri == NVSDK_NGX_Result_Success);
                     logf("[NRPRE] 2b: SNIPPET Init_Ext -> 0x%08X", (unsigned)ri);
                 }
                 if (ri == NVSDK_NGX_Result_Success) {
@@ -2438,6 +2519,12 @@ static void load_settings(reshade::api::effect_runtime *rt) {
     if (reshade::get_config_value(rt, "NRPreUpscale", "Passes", v))        g_passes = (v < 1 ? 1 : (v > 3 ? 3 : v));
     if (reshade::get_config_value(rt, "NRPreUpscale", "Style", v))         g_style = (v == 1) ? 1 : 0;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Placement", v))     g_placement = (v == 1) ? 1 : 0;
+    if (reshade::get_config_value(rt, "NRPreUpscale", "HookMethod", v)) {
+        if (v < kHookOff) v = kHookOff;
+        if (v > kHookPresent) v = kHookPresent;
+        g_hook_method = v;
+    }
+    if (g_hook_method == kHookUpscaled) g_placement = 1;
     if (reshade::get_config_value(rt, "NRPreUpscale", "Codec", v))         g_codec_on = (v != 0);
     if (reshade::get_config_value(rt, "NRPreUpscale", "AutoMask", v)) g_auto_mask = (v != 0);
     // ReShade re-creates the effect runtime several times per session; do not let
@@ -2498,7 +2585,9 @@ static void save_settings(reshade::api::effect_runtime *rt) {
     reshade::set_config_value(rt, "NRPreUpscale", "Cadence", g_skip_n);
     reshade::set_config_value(rt, "NRPreUpscale", "Passes", g_passes);
     reshade::set_config_value(rt, "NRPreUpscale", "Style", g_style);
+    if (g_hook_method == kHookUpscaled) g_placement = 1;
     reshade::set_config_value(rt, "NRPreUpscale", "Placement", g_placement);
+    reshade::set_config_value(rt, "NRPreUpscale", "HookMethod", g_hook_method);
     reshade::set_config_value(rt, "NRPreUpscale", "NetScale", g_net_scale);
     reshade::set_config_value(rt, "NRPreUpscale", "AsyncNetwork", g_async_net ? 1 : 0);
     reshade::set_config_value(rt, "NRPreUpscale", "UniformDelta", g_uniform_delta ? 1 : 0);
@@ -2593,9 +2682,21 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     ImGui::SetItemTooltip("Runs DLSS 5 Neural Rendering on the DLSS input at render resolution, "
                           "then hands the result to the game's own DLSS upscale.");
     ImGui::SameLine();
-    if (g_nr_enabled && g_nr_handle != nullptr) ImGui::TextColored(kOn, "ON");
-    else if (g_nr_enabled)                      ImGui::TextColored(kWarn, "ON (waiting for the game to create DLSS)");
-    else                                        ImGui::TextColored(kOff, "OFF");
+    if (g_conflict) {
+        ImGui::TextColored(kOff, "standing down");
+    } else if (g_hook_method == kHookOff) {
+        ImGui::TextColored(kOff, "OFF (hook method)");
+    } else if (!g_nr_enabled) {
+        ImGui::TextColored(kOff, "OFF");
+    } else if (g_eval_hook_count == 0) {
+        ImGui::TextColored(kWarn, "ON (looking for NGX / DLSS modules...)");
+    } else if (g_arm_dlss_evals == 0) {
+        ImGui::TextColored(kWarn, "ON (waiting for the game to call DLSS — menus often don't; try in-world or change Hook method / Poke)");
+    } else if (g_nr_handle == nullptr) {
+        ImGui::TextColored(kWarn, "ON (DLSS seen; neural feature not created — Poke to retry)");
+    } else {
+        ImGui::TextColored(kOn, "ON");
+    }
 
     {
         static const char *keys[] = { "F1", "F2", "F3", "F4", "F5", "F6",
@@ -2618,7 +2719,35 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
         ImGui::SetItemTooltip("Before: the network runs on the render-resolution colour DLSS is about "
                               "to upscale, so its cost follows the game's render scale. After: it runs "
                               "on the finished output frame, as RenoDX's add-on does, at output cost. "
-                              "Same controls either way; switching rebuilds the network.");
+                              "Same controls either way; switching rebuilds the network. "
+                              "Does not re-arm NGX hooks — that is Hook method / Poke.");
+    }
+
+    {
+        const char *methods[] = { "Off", "Auto", "Upscaled", "FrameGen", "Present" };
+        int hm = g_hook_method;
+        if (hm < kHookOff || hm > kHookPresent) hm = kHookAuto;
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+        if (ImGui::Combo("Hook method", &hm, methods, 5)) {
+            g_hook_method = hm;
+            if (hm == kHookUpscaled) g_placement = 1;
+            changed = true;
+            request_poke("hook-method-changed");
+        }
+        ImGui::SetItemTooltip(
+            "Where to attach NGX Evaluate hooks (RenoDX Hook method). "
+            "Orthogonal to Placement. Auto = current module scan. "
+            "Upscaled = Auto scan and force Placement After. "
+            "FrameGen also adopts Streamline *dlssg* exporters (not bare nvngx_dlssg.dll). "
+            "Present incrementally scans for late-loaded modules. Changing this re-arms hooks.");
+    }
+    if (g_nr_enabled) {
+        if (ImGui::Button("Poke"))
+            request_poke("ui");
+        ImGui::SetItemTooltip(
+            "Re-arm NGX hooks for the selected Hook method and clear the neural create latch. "
+            "Does not invent DLSS if the game never evaluates.");
+        ImGui::TextDisabled("Poke re-arms hooks; it does not invent DLSS calls.");
     }
 
     // ---- cost ----------------------------------------------------------------
@@ -2933,6 +3062,8 @@ static void draw_overlay(reshade::api::effect_runtime *rt) {
     ImGui::Spacing();
     if (ImGui::Button("Reset to defaults")) {
         g_nr_enabled = true; g_skip_n = 1; g_passes = 1; g_style = 1; g_placement = 0;
+        g_hook_method = kHookAuto;
+        request_poke("defaults");
         g_preset = 3; apply_preset(3); g_effect_strength = 1.0f; g_auto_mask = true;
         g_codec_on = true; g_auto_pw = true; g_paper_white = 1.0f; g_knee = 0.75f;
         g_transfer = 1.0f; g_color_strength = 1.0f; g_chroma_transfer = 0.0f; g_input_gain = 1.0f;
@@ -3180,6 +3311,28 @@ static void release_state(const char *why) {
 }
 
 static bool g_hooked = false;
+static LPVOID g_create_target = nullptr;
+static const unsigned kPresentScanPeriod = 60;
+static const unsigned kMaxSeenMods = 512;
+static HMODULE g_seen_mods[kMaxSeenMods] = {};
+static unsigned g_seen_n = 0;
+static unsigned g_present_scans = 0;
+static unsigned g_hook_fail_logs = 0;
+
+static void path_lower(HMODULE m, wchar_t *out, size_t n) {
+    if (m == nullptr || GetModuleFileNameW(m, out, (DWORD)n) == 0) { out[0] = 0; return; }
+    for (wchar_t *p = out; *p; ++p)
+        if (*p >= L'A' && *p <= L'Z') *p += 32;
+}
+
+static bool path_has(const wchar_t *path, const wchar_t *need) {
+    for (const wchar_t *p = path; *p; ++p) {
+        const wchar_t *n = need, *q = p;
+        while (*n && *q == *n) { ++q; ++n; }
+        if (!*n) return true;
+    }
+    return false;
+}
 
 // Frame generation exports the same evaluate, and hooking it wrecks the cadence.
 //
@@ -3196,19 +3349,172 @@ static bool g_hooked = false;
 // effect lands on the wrong frames -- which is why the artefact grows with both
 // the multiplier and the cadence.
 //
-// There was never anything here to hook: frame generation runs after the upscaler,
-// on an image this add-on has already been applied to. Skip it by name.
+// Auto / Upscaled / Present skip *dlssg* by name. FrameGen may attach a
+// Streamline-family *dlssg* exporter (not bare nvngx_dlssg.dll); those slots
+// carry t_fg_guard so a zero-jitter evaluate never claims the frame.
 static bool is_framegen_snippet(HMODULE m) {
     wchar_t path[MAX_PATH];
-    if (GetModuleFileNameW(m, path, MAX_PATH) == 0) return false;
-    for (wchar_t *p = path; *p; ++p)
-        if (*p >= L'A' && *p <= L'Z') *p += 32;
-    for (const wchar_t *p = path; *p; ++p) {
-        const wchar_t *n = L"dlssg", *q = p;
-        while (*n && *q == *n) { ++q; ++n; }
-        if (!*n) return true;
-    }
+    path_lower(m, path, MAX_PATH);
+    return path_has(path, L"dlssg");
+}
+
+static bool is_streamline_fg_allowlisted(HMODULE m) {
+    wchar_t path[MAX_PATH];
+    path_lower(m, path, MAX_PATH);
+    if (!path_has(path, L"dlssg")) return false;
+    return path_has(path, L"streamline")
+        || path_has(path, L"sl.dlss")
+        || path_has(path, L"sl.interposer")
+        || path_has(path, L"\\sl.")
+        || path_has(path, L"/sl.");
+}
+
+static bool module_wanted(HMODULE m, int method) {
+    if (!is_framegen_snippet(m)) return true;
+    return method == kHookFrameGen && is_streamline_fg_allowlisted(m);
+}
+
+static bool module_seen(HMODULE m) {
+    for (unsigned i = 0; i < g_seen_n; ++i)
+        if (g_seen_mods[i] == m) return true;
     return false;
+}
+
+static void mark_module_seen(HMODULE m) {
+    if (m == nullptr || module_seen(m) || g_seen_n >= kMaxSeenMods) return;
+    g_seen_mods[g_seen_n++] = m;
+}
+
+static void clear_seen_modules() {
+    g_seen_n = 0;
+    for (unsigned i = 0; i < kMaxSeenMods; ++i) g_seen_mods[i] = nullptr;
+}
+
+static bool target_owned(LPVOID target) {
+    if (target == nullptr) return false;
+    for (unsigned i = 0; i < kMaxNgx; ++i)
+        if (g_eval_targets[i] == target) return true;
+    return false;
+}
+
+static int first_free_eval_slot() {
+    for (unsigned i = 0; i < kMaxNgx; ++i)
+        if (g_eval_targets[i] == nullptr) return (int)i;
+    return -1;
+}
+
+static void drop_eval_slot(unsigned i) {
+    if (i >= kMaxNgx || g_eval_targets[i] == nullptr) return;
+    MH_DisableHook(g_eval_targets[i]);
+    MH_RemoveHook(g_eval_targets[i]);
+    g_eval_targets[i] = nullptr;
+    g_orig_eval_n[i] = nullptr;
+    g_eval_fg_slot[i] = false;
+    if (g_eval_hook_count > 0) --g_eval_hook_count;
+}
+
+static void disarm_hooks() {
+    for (unsigned i = 0; i < kMaxNgx; ++i)
+        drop_eval_slot(i);
+    if (g_create_target != nullptr) {
+        MH_DisableHook(g_create_target);
+        MH_RemoveHook(g_create_target);
+        g_create_target = nullptr;
+        g_orig_create = nullptr;
+    }
+    g_orig_eval = nullptr;
+    g_hooked = false;
+    g_eval_hook_count = 0;
+}
+
+static bool attach_eval_target(LPVOID target, HMODULE mod, bool fg_extra) {
+    if (target == nullptr) return false;
+    if (target_owned(target)) return true;
+    const int slot = first_free_eval_slot();
+    if (slot < 0) return false;
+    MH_STATUS cr = MH_CreateHook(target, const_cast<LPVOID>(kEvalThunks[slot]),
+                                 reinterpret_cast<LPVOID *>(&g_orig_eval_n[slot]));
+    if (cr == MH_ERROR_ALREADY_CREATED) {
+        MH_RemoveHook(target);
+        cr = MH_CreateHook(target, const_cast<LPVOID>(kEvalThunks[slot]),
+                           reinterpret_cast<LPVOID *>(&g_orig_eval_n[slot]));
+    }
+    if (cr != MH_OK) return false;
+    const bool on = MH_EnableHook(target) == MH_OK;
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(mod, path, MAX_PATH);
+    if (on || g_hook_fail_logs < 4) {
+        logf("[NRPRE] hook %u on NVSDK_NGX_D3D12_EvaluateFeature: %s  %S%s",
+             (unsigned)slot, on ? "OK" : "FAILED", path, fg_extra ? "  [FrameGen extra]" : "");
+        if (!on) ++g_hook_fail_logs;
+    }
+    if (!on) {
+        MH_RemoveHook(target);
+        g_orig_eval_n[slot] = nullptr;
+        return false;
+    }
+    g_eval_targets[slot] = target;
+    g_eval_fg_slot[slot] = fg_extra;
+    ++g_eval_hook_count;
+    if (g_orig_eval == nullptr) g_orig_eval = g_orig_eval_n[slot];
+    return true;
+}
+
+static void attach_create_from(HMODULE *cands, unsigned n) {
+    if (g_create_target != nullptr) return;
+    for (unsigned i = 0; i < n; ++i) {
+        auto ctarget = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_CreateFeature");
+        if (ctarget == nullptr) continue;
+        if (MH_CreateHook(reinterpret_cast<LPVOID>(ctarget), reinterpret_cast<LPVOID>(&hk_create),
+                          reinterpret_cast<LPVOID *>(&g_orig_create)) != MH_OK) continue;
+        if (MH_EnableHook(reinterpret_cast<LPVOID>(ctarget)) == MH_OK) {
+            g_create_target = reinterpret_cast<LPVOID>(ctarget);
+            logf("[NRPRE] hook on NVSDK_NGX_D3D12_CreateFeature: OK (module %u)", i);
+        } else {
+            MH_RemoveHook(reinterpret_cast<LPVOID>(ctarget));
+            g_orig_create = nullptr;
+        }
+        break;
+    }
+}
+
+static unsigned gather_eval_candidates(HMODULE *cands, unsigned max, HMODULE self,
+                                      bool only_new) {
+    unsigned n = 0;
+    HMODULE mods[kMaxSeenMods];
+    DWORD needed = 0;
+    unsigned total = 0;
+    if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &needed))
+        total = needed / sizeof(HMODULE);
+
+    auto consider = [&](HMODULE m) {
+        if (m == nullptr || m == self) return;
+        if (n >= max) return;
+        for (unsigned k = 0; k < n; ++k)
+            if (cands[k] == m) return;
+        if (only_new && module_seen(m)) return;
+        if (!module_wanted(m, g_hook_method)) { mark_module_seen(m); return; }
+        if (GetProcAddress(m, "NVSDK_NGX_D3D12_EvaluateFeature") == nullptr) {
+            mark_module_seen(m);
+            return;
+        }
+        cands[n++] = m;
+        mark_module_seen(m);
+    };
+
+    if (HMODULE drv = GetModuleHandleW(L"_nvngx.dll"))
+        consider(drv);
+    for (unsigned i = 0; i < total; ++i)
+        consider(mods[i]);
+    return n;
+}
+
+static void drop_unwanted_hooks() {
+    for (unsigned i = 0; i < kMaxNgx; ++i) {
+        if (g_eval_targets[i] == nullptr) continue;
+        if (g_hook_method != kHookFrameGen && g_eval_fg_slot[i])
+            drop_eval_slot(i);
+    }
 }
 
 // Two add-ons cannot both detour the NGX entry points. Both lay trampolines over
@@ -3238,10 +3544,12 @@ static bool conflicting_addon_loaded() {
 }
 
 static void install_hook() {
-    if (g_hooked) return;
+    if (g_hook_method == kHookOff) return;
+    if (g_conflict) return;
     if (conflicting_addon_loaded()) {
-        g_hooked = true;            // decided once; never reconsidered this session
+        g_hooked = true;
         g_conflict = true;
+        g_eval_hook_count = 0;
         logf("[NRPRE] %s is loaded and detours the same NGX entry points. Two "
              "add-ons cannot share them and the game crashes when both drive the "
              "neural runtime, so this one is standing down: nothing is hooked and "
@@ -3260,58 +3568,116 @@ static void install_hook() {
     // loaded at once. Waiting for the driver alone leaves those games unhooked;
     // picking by name or by a timer picks wrong. Hook them all instead.
     HMODULE cands[kMaxNgx];
-    unsigned n = 0;
-    if (HMODULE drv = GetModuleHandleW(L"_nvngx.dll"))
-        if (GetProcAddress(drv, "NVSDK_NGX_D3D12_EvaluateFeature")) cands[n++] = drv;
-
-    HMODULE mods[512];
-    DWORD needed = 0;
-    if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &needed)) {
-        const unsigned total = needed / sizeof(HMODULE);
-        for (unsigned i = 0; i < total && n < kMaxNgx; ++i) {
-            if (mods[i] == self) continue;                 // never hook ourselves
-            bool dup = false;
-            for (unsigned k = 0; k < n; ++k) dup |= (cands[k] == mods[i]);
-            if (dup) continue;
-            if (is_framegen_snippet(mods[i])) continue;      // see above
-            if (GetProcAddress(mods[i], "NVSDK_NGX_D3D12_EvaluateFeature")) cands[n++] = mods[i];
-        }
-    }
-    if (n == 0) return;                                    // nothing loaded yet, retry next present
+    unsigned n = gather_eval_candidates(cands, kMaxNgx, self, false);
+    if (n == 0) return;
 
     if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) {
         logf("[NRPRE] MH_Initialize failed"); return;
     }
-    g_hooked = true;                                       // only ever try once
 
-    unsigned ok = 0;
     for (unsigned i = 0; i < n; ++i) {
         auto target = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_EvaluateFeature");
-        if (target == nullptr) continue;
-        if (MH_CreateHook(reinterpret_cast<LPVOID>(target),
-                          const_cast<LPVOID>(kEvalThunks[i]),
-                          reinterpret_cast<LPVOID *>(&g_orig_eval_n[i])) != MH_OK) continue;
-        const bool on = MH_EnableHook(reinterpret_cast<LPVOID>(target)) == MH_OK;
-        wchar_t path[MAX_PATH] = {};
-        GetModuleFileNameW(cands[i], path, MAX_PATH);
-        logf("[NRPRE] hook %u on NVSDK_NGX_D3D12_EvaluateFeature: %s  %S",
-             i, on ? "OK" : "FAILED", path);
-        if (on) { ++ok; if (g_orig_eval == nullptr) g_orig_eval = g_orig_eval_n[i]; }
+        attach_eval_target(reinterpret_cast<LPVOID>(target), cands[i],
+                           is_framegen_snippet(cands[i]));
     }
-    if (ok == 0) { logf("[NRPRE] no NGX evaluate could be hooked"); return; }
-
-    // The create hook only reads what the game asks for, so one is enough: take
-    // it from the driver when present, otherwise from the first candidate.
-    for (unsigned i = 0; i < n; ++i) {
-        auto ctarget = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_CreateFeature");
-        if (ctarget == nullptr) continue;
-        if (MH_CreateHook(reinterpret_cast<LPVOID>(ctarget), reinterpret_cast<LPVOID>(&hk_create),
-                          reinterpret_cast<LPVOID *>(&g_orig_create)) != MH_OK) continue;
-        if (MH_EnableHook(reinterpret_cast<LPVOID>(ctarget)) == MH_OK) {
-            logf("[NRPRE] hook on NVSDK_NGX_D3D12_CreateFeature: OK (module %u)", i);
+    if (g_eval_hook_count == 0) {
+        if (g_hook_fail_logs < 4) {
+            logf("[NRPRE] no NGX evaluate could be hooked");
+            ++g_hook_fail_logs;
         }
-        break;
+        return;
     }
+    g_hooked = true;
+    attach_create_from(cands, n);
+}
+
+static void tick_hooks() {
+    if (g_hook_method == kHookOff || g_conflict || g_hooks_frozen) return;
+    if (g_hook_method != kHookPresent) {
+        if (!g_hooked) install_hook();
+        return;
+    }
+    if (g_eval_hook_count > 0 && g_arm_dlss_evals > 0) return;
+    if (!g_hooked) {
+        install_hook();
+        return;
+    }
+    if ((++g_present_scans % kPresentScanPeriod) != 0) return;
+
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&install_hook), &self);
+    HMODULE cands[kMaxNgx];
+    unsigned n = gather_eval_candidates(cands, kMaxNgx, self, true);
+    if (n == 0) return;
+    if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED)
+        return;
+    unsigned added = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        auto target = GetProcAddress(cands[i], "NVSDK_NGX_D3D12_EvaluateFeature");
+        if (attach_eval_target(reinterpret_cast<LPVOID>(target), cands[i],
+                               is_framegen_snippet(cands[i])))
+            ++added;
+    }
+    if (added)
+        logf("[NRPRE] present-scan: attached %u new Evaluate exporter(s), hooked=%u",
+             added, g_eval_hook_count);
+    attach_create_from(cands, n);
+    if (g_eval_hook_count > 0) g_hooked = true;
+}
+
+static void apply_poke(reshade::api::command_queue *queue) {
+    if (!g_poke_pending) return;
+    if (g_eval_inflight != 0) {
+        if (queue != nullptr) queue->wait_idle();
+        if (g_eval_inflight != 0) return;
+    }
+
+    const unsigned prev_evals = (unsigned)g_arm_evals;
+    const char *why = g_poke_why ? g_poke_why : "poke";
+
+    if (g_hook_method == kHookUpscaled) g_placement = 1;
+    reset_failed_snip_init();
+    if (g_nr_handle != nullptr) {
+        if (queue != nullptr) queue->wait_idle();
+        release_state("poke");
+    }
+    g_setup_done = false;
+    g_force_reset_frames = 8;
+    InterlockedExchange(&g_arm_evals, 0);
+    InterlockedExchange(&g_arm_dlss_evals, 0);
+    clear_seen_modules();
+    g_present_scans = 0;
+    g_hook_fail_logs = 0;
+
+    if (g_conflict || conflicting_addon_loaded()) {
+        g_conflict = true;
+        disarm_hooks();
+        g_hooked = true;
+        logf("[NRPRE] poke: method=%s evals=%u hooked=0 conflict=1 why=%s",
+             hook_method_name(g_hook_method), prev_evals, why);
+        g_poke_pending = false;
+        InterlockedExchange(&g_hooks_frozen, 0);
+        return;
+    }
+
+    if (g_hook_method == kHookOff) {
+        disarm_hooks();
+        logf("[NRPRE] poke: method=Off evals=%u hooked=0 conflict=0 why=%s",
+             prev_evals, why);
+        g_poke_pending = false;
+        InterlockedExchange(&g_hooks_frozen, 0);
+        return;
+    }
+
+    drop_unwanted_hooks();
+    install_hook();
+    logf("[NRPRE] poke: method=%s evals=%u hooked=%u conflict=%d why=%s",
+         hook_method_name(g_hook_method), prev_evals, g_eval_hook_count,
+         g_conflict ? 1 : 0, why);
+    g_poke_pending = false;
+    InterlockedExchange(&g_hooks_frozen, 0);
 }
 
 // Alt-tab keeps the D3D12 device alive and only resizes the swapchain, so the
@@ -3379,6 +3745,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
     }
     prev_down = down;
     if (g_settings_dirty && g_rt != nullptr) { g_settings_dirty = false; save_settings(g_rt); }
+    apply_poke(queue);
 
     {   // Say the two things that are actually wrong most often, once, after long
         // enough that neither can be a slow start. Without this the log for a
@@ -3388,14 +3755,16 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         static bool said = false;
         if (!said && ++frames == 1200) {
             said = true;
-            if (g_logged == 0)
+            if (g_arm_dlss_evals == 0)
                 logf("[NRPRE] 1200 frames and the game has not called DLSS once. Turn DLSS on "
-                     "in the game's own graphics settings; with it off there is nothing for "
-                     "this add-on to attach to.");
+                     "in the game's own graphics settings, try in-world, or change Hook method / Poke; "
+                     "with DLSS off there is nothing for this add-on to attach to. hooked=%u method=%s",
+                     g_eval_hook_count, hook_method_name(g_hook_method));
             else if (g_nr_handle == nullptr)
                 logf("[NRPRE] the game is calling DLSS, but the neural feature was never "
                      "created. Check that nvngx_dlssnr.dll sits in the game folder and that "
-                     "this file's name still contains 'nvngx.dll'.");
+                     "this file's name still contains 'nvngx.dll'. Poke retries create. evals=%u hooked=%u",
+                     (unsigned)g_arm_dlss_evals, g_eval_hook_count);
         }
     }
 
@@ -3510,7 +3879,7 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
         tick_exposure(gq);
         exp_queue_tick(g_device, gq);
     }
-    install_hook();
+    tick_hooks();
     // NOTE: nvngx_dlssnr!NVSDK_NGX_D3D12_CreateFeature is ALREADY detoured by
     // another add-on. A second MinHook trampoline on the same prologue makes the
     // snippet create fail with 0xBAD00002 (PlatformError). Do not hook it.
